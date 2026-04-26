@@ -7,11 +7,17 @@
 # Add to /etc/rc.conf to enable:
 #   beastied_enable="YES"
 #
-# Optional overrides:
+# Optional overrides in /etc/rc.conf:
 #   beastied_config="/usr/local/etc/beastiemon.conf"
-#   beastied_user="_beastie"
-#   beastied_group="_beastie"
+#   beastied_runas="_beastie"     # unprivileged user daemon drops to
 #   beastied_flags=""
+#
+# NOTE: The variable is named "beastied_runas" on purpose.
+# rc.subr treats ${name}_user as a magic variable and runs the *entire*
+# command line (including daemon(8) itself) as that user, which prevents
+# daemon from writing its PID file to /var/run/.  By using a different name
+# we keep daemon(8) starting as root so it can write the PID file, then
+# it drops to _beastie via its own -u flag before exec'ing beastied.
 
 . /etc/rc.subr
 
@@ -20,8 +26,7 @@ rcvar="beastied_enable"
 load_rc_config "$name"
 
 : ${beastied_enable:="NO"}
-: ${beastied_user:="_beastie"}
-: ${beastied_group:="_beastie"}
+: ${beastied_runas:="_beastie"}
 : ${beastied_config:="/usr/local/etc/beastiemon.conf"}
 : ${beastied_logfile:="/var/log/beastied.log"}
 : ${beastied_flags:=""}
@@ -29,13 +34,14 @@ load_rc_config "$name"
 pidfile="/var/run/beastied.pid"
 procname="%%PREFIX%%/bin/beastied"
 command="/usr/sbin/daemon"
-command_args="-f -r -P ${pidfile} -u ${beastied_user} \
+command_args="-f -r -P ${pidfile} -u ${beastied_runas} \
     -o ${beastied_logfile} ${procname} -config ${beastied_config} ${beastied_flags}"
 
 start_precmd="beastied_prestart"
 beastied_prestart() {
+    # Create/fix log file ownership before daemon drops privileges.
     touch "${beastied_logfile}"
-    chown "${beastied_user}:${beastied_group}" "${beastied_logfile}"
+    chown root:"${beastied_runas}" "${beastied_logfile}"
     chmod 0640 "${beastied_logfile}"
 }
 
