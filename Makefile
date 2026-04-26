@@ -66,6 +66,7 @@ stage: build
 	chmod 0755 $(STAGE)$(PREFIX)/etc/rc.d/beastied
 	install -m 0644 freebsd/beastiemon.conf \
 	    $(STAGE)$(PREFIX)/etc/beastiemon.conf.sample
+	# /var/log is a base-system dir; the rc.d script creates the log file at runtime.
 
 install: stage
 	cp -R $(STAGE)/* $(DESTDIR)/

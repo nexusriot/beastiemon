@@ -21,10 +21,6 @@ files: {
   /usr/local/etc/beastiemon.conf.sample: "-",
 }
 
-directories: {
-  /var/log: "y",
-}
-
 scripts: {
   pre-install: <<EOD
     # Create system user and group for the daemon.
