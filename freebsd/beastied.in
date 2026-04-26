@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# PROVIDE: beastied
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# Add to /etc/rc.conf to enable:
+#   beastied_enable="YES"
+#
+# Optional overrides:
+#   beastied_config="/usr/local/etc/beastiemon.conf"
+#   beastied_user="_beastie"
+#   beastied_group="_beastie"
+#   beastied_flags=""
+
+. /etc/rc.subr
+
+name="beastied"
+rcvar="beastied_enable"
+load_rc_config "$name"
+
+: ${beastied_enable:="NO"}
+: ${beastied_user:="_beastie"}
+: ${beastied_group:="_beastie"}
+: ${beastied_config:="/usr/local/etc/beastiemon.conf"}
+: ${beastied_logfile:="/var/log/beastied.log"}
+: ${beastied_flags:=""}
+
+pidfile="/var/run/beastied.pid"
+procname="%%PREFIX%%/bin/beastied"
+command="/usr/sbin/daemon"
+command_args="-f -r -P ${pidfile} -u ${beastied_user} \
+    -o ${beastied_logfile} ${procname} -config ${beastied_config} ${beastied_flags}"
+
+start_precmd="beastied_prestart"
+beastied_prestart() {
+    touch "${beastied_logfile}"
+    chown "${beastied_user}:${beastied_group}" "${beastied_logfile}"
+    chmod 0640 "${beastied_logfile}"
+}
+
+run_rc_command "$1"

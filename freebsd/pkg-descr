@@ -1,0 +1,10 @@
+BeastieMon — lightweight FreeBSD system monitoring daemon.
+
+Collects CPU, memory, disk I/O, network, filesystem, and temperature
+metrics every second and serves them through a self-contained web
+dashboard with live graphs (uPlot) and a command-line tool (beastie).
+
+No authentication — bind to localhost and proxy through nginx/haproxy
+if LAN or TLS access is required.
+
+WWW: https://github.com/yourorg/beastiemon

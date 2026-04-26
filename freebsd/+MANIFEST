@@ -1,0 +1,62 @@
+name: beastiemon
+version: "%%VERSION%%"
+origin: sysutils/beastiemon
+comment: Lightweight FreeBSD system monitor with web UI and CLI
+maintainer: you@example.org
+www: https://github.com/yourorg/beastiemon
+prefix: /usr/local
+desc: <<EOD
+BeastieMon collects host metrics (CPU, memory, disk, network, temperature)
+on FreeBSD and serves a self-contained web dashboard with live graphs.
+A CLI companion (beastie) provides colourised terminal output.
+EOD
+categories: [sysutils]
+licenselogic: single
+licenses: [BSD2CLAUSE]
+
+files: {
+  /usr/local/bin/beastied: "-",
+  /usr/local/bin/beastie: "-",
+  /usr/local/etc/rc.d/beastied: "-",
+  /usr/local/etc/beastiemon.conf.sample: "-",
+}
+
+directories: {
+  /var/log: "y",
+}
+
+scripts: {
+  pre-install: <<EOD
+    # Create system user and group for the daemon.
+    pw groupadd _beastie -g 874 2>/dev/null || :
+    pw useradd  _beastie -u 874 -g 874 \
+        -d /nonexistent -s /usr/sbin/nologin \
+        -c "BeastieMon daemon" 2>/dev/null || :
+    # Disk I/O stats via devstat require the operator group.
+    pw groupmod operator -m _beastie 2>/dev/null || :
+EOD
+
+  post-install: <<EOD
+    # Install default config if none exists.
+    [ -f /usr/local/etc/beastiemon.conf ] || \
+        cp /usr/local/etc/beastiemon.conf.sample \
+           /usr/local/etc/beastiemon.conf
+    chown root:_beastie /usr/local/etc/beastiemon.conf
+    chmod 0640 /usr/local/etc/beastiemon.conf
+
+    echo ""
+    echo "======================================================"
+    echo "  BeastieMon installed."
+    echo "  Enable:  sysrc beastied_enable=YES"
+    echo "  Start:   service beastied start"
+    echo "  Web UI:  http://127.0.0.1:8088/"
+    echo "  CLI:     beastie [status|cpu|mem|net|disk|top]"
+    echo "======================================================"
+EOD
+
+  post-deinstall: <<EOD
+    echo "Note: user/group _beastie were NOT removed."
+    echo "Run manually if desired:"
+    echo "  pw userdel _beastie && pw groupdel _beastie"
+EOD
+}
