@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BeastieMon</title>
+  <link rel="stylesheet" href="style.css">
+  <!-- uPlot — fetch offline copy via `make vendor-js` -->
+  <script src="https://unpkg.com/uplot@1.6.27/dist/uPlot.iife.min.js"></script>
+  <link  rel="stylesheet" href="https://unpkg.com/uplot@1.6.27/dist/uPlot.min.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <pre class="beastie">    ,        ,
+   /(        )`
+   \ \___   / |
+   /- _  `-/  '
+  (/\/ \ \   /\
+  / /   | `   /
+  O O   ) /   |
+  `-^--'`&lt;     '
+ (_.)  _  )   /
+  `.___/`    /
+    `-----' /
+&lt;----.     '__\
+&lt;----|====O)))==)
+&lt;----'    `--'</pre>
+      <div class="brand-text">
+        <h1>BeastieMon</h1>
+        <div id="host-line" class="subtitle">connecting…</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div id="uptime-line" class="meta"></div>
+      <div class="range-picker">
+        <label>Range:</label>
+        <select id="range-select">
+          <option value="5m">5 min</option>
+          <option value="15m" selected>15 min</option>
+          <option value="1h">1 hour</option>
+          <option value="6h">6 hours</option>
+          <option value="24h">24 hours</option>
+        </select>
+      </div>
+      <div id="live-dot" class="live-dot" title="Live"></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="grid">
+      <div class="card span2" id="card-cpu">
+        <h2>CPU <span class="card-val" id="cpu-pct">—</span></h2>
+        <div id="chart-cpu"></div>
+      </div>
+      <div class="card" id="card-load">
+        <h2>Load Average</h2>
+        <div id="chart-load"></div>
+        <div class="load-vals">
+          <span id="load1">—</span>
+          <span id="load5">—</span>
+          <span id="load15">—</span>
+          <label>1m</label><label>5m</label><label>15m</label>
+        </div>
+      </div>
+
+      <div class="card span2" id="card-mem">
+        <h2>Memory <span class="card-val" id="mem-pct">—</span></h2>
+        <div id="chart-mem"></div>
+        <div class="mem-legend">
+          <span class="dot used"></span>Used
+          <span class="dot free"></span>Free
+          <span class="dot swap"></span>Swap
+        </div>
+      </div>
+
+      <div class="card span2" id="card-net">
+        <h2>Network</h2>
+        <div id="chart-net"></div>
+        <div class="iface-tabs" id="iface-tabs"></div>
+      </div>
+
+      <div class="card span2" id="card-disk">
+        <h2>Disk I/O</h2>
+        <div id="chart-disk"></div>
+        <div class="iface-tabs" id="dev-tabs"></div>
+      </div>
+
+      <div class="card" id="card-temp">
+        <h2>Temperatures</h2>
+        <div id="temp-grid"></div>
+      </div>
+
+      <div class="card" id="card-fs">
+        <h2>Filesystems</h2>
+        <div id="fs-grid"></div>
+      </div>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
