@@ -192,7 +192,6 @@ function buildDiskChart(data) {
   state.resizers.disk = autoresize(state.charts.disk, el);
 }
 
-// ── Fetch helpers ─────────────────────────────────────────────────────────────
 
 async function fetchSeries(metric, extra = '') {
   const r = await fetch(`/api/series?metric=${metric}&range=${state.range}${extra}`);
@@ -221,7 +220,6 @@ async function loadAll() {
     loadNet(state.netIface), loadDisk(state.diskDev)]);
 }
 
-// ── Live updates ──────────────────────────────────────────────────────────────
 
 function appendToChart(chart, ts, values) {
   if (!chart) return;
@@ -311,7 +309,6 @@ function applyLiveSnap(snap) {
   buildIfaceTabs(snap.net || [], snap.disk || []);
 }
 
-// ── Static widget renderers ───────────────────────────────────────────────────
 
 function renderTemps(temps) {
   const grid = document.getElementById('temp-grid');
@@ -387,7 +384,6 @@ function buildIfaceTabs(nets, disks) {
   }
 }
 
-// ── SSE ───────────────────────────────────────────────────────────────────────
 
 function connectSSE() {
   const dot = document.getElementById('live-dot');
@@ -404,7 +400,6 @@ function connectSSE() {
   };
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
   // Host info
