@@ -32,10 +32,15 @@ load_rc_config "$name"
 : ${beastied_flags:=""}
 
 pidfile="/var/run/beastied.pid"
-procname="%%PREFIX%%/bin/beastied"
+
+# procname must match the process that OWNS the pidfile.
+# daemon(8) -P writes its own (supervisor) PID, so procname is daemon, not beastied.
+# rc.subr uses procname + pidfile for check_pidfile / pgrep, stop, and status.
+procname="/usr/sbin/daemon"
 command="/usr/sbin/daemon"
 command_args="-f -r -P ${pidfile} -u ${beastied_runas} \
-    -o ${beastied_logfile} ${procname} -config ${beastied_config} ${beastied_flags}"
+    -o ${beastied_logfile} %%PREFIX%%/bin/beastied \
+    -config ${beastied_config} ${beastied_flags}"
 
 start_precmd="beastied_prestart"
 beastied_prestart() {
