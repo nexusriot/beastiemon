@@ -21,6 +21,7 @@ type CollectConfig struct {
 	FSInclude  []string `toml:"fs_include"`
 	NetExclude []string `toml:"net_exclude"`
 	RingSize   int      `toml:"ring_size"`
+	TopProcs   int      `toml:"top_procs"`
 }
 
 // duration wraps time.Duration for TOML unmarshaling.
@@ -45,6 +46,7 @@ func Default() Config {
 			FSInclude:  []string{"/", "/var", "/usr", "/tmp"},
 			NetExclude: []string{"lo0"},
 			RingSize:   3600,
+			TopProcs:   5,
 		},
 	}
 }

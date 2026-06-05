@@ -305,6 +305,9 @@ function applyLiveSnap(snap) {
   // Filesystems
   renderFS(snap.fs || []);
 
+  // Top processes
+  renderProcs(snap.procs || []);
+
   // Build iface / dev tabs if not yet built.
   buildIfaceTabs(snap.net || [], snap.disk || []);
 }
@@ -341,6 +344,37 @@ function renderFS(fsList) {
       </div>
     </div>`;
   }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderProcs(procs) {
+  const el = document.getElementById('proc-table');
+  if (!el) return;
+  if (!procs.length) {
+    el.innerHTML = '<div style="color:var(--muted)">No data yet — needs two samples.</div>';
+    return;
+  }
+  const rows = procs.map(p => {
+    const cls = p.cpu_pct >= 90 ? 'crit' : p.cpu_pct >= 50 ? 'warn' : '';
+    return `<tr>
+      <td class="proc-pid">${p.pid}</td>
+      <td class="proc-name">${escapeHtml(p.name)}</td>
+      <td class="proc-num proc-cpu ${cls}">${p.cpu_pct.toFixed(1)}%</td>
+      <td class="proc-num">${p.mem_pct.toFixed(1)}%</td>
+      <td class="proc-num">${humanBytes(p.rss)}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<table class="proc-table">
+    <thead><tr>
+      <th>PID</th><th>Command</th>
+      <th class="proc-num">CPU</th><th class="proc-num">MEM</th><th class="proc-num">RSS</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
 }
 
 let tabsBuilt = false;

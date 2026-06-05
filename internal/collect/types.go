@@ -11,6 +11,7 @@ type Snapshot struct {
 	Disk   []DiskStats `json:"disk"`
 	FS     []FSStats  `json:"fs"`
 	Temps  []TempStat `json:"temps,omitempty"`
+	Procs  []ProcStat `json:"procs,omitempty"`
 	Load   LoadStats  `json:"load"`
 	Uptime uint64     `json:"uptime"`
 }
@@ -63,6 +64,14 @@ type FSStats struct {
 type TempStat struct {
 	Name    string  `json:"name"`
 	Celsius float64 `json:"celsius"`
+}
+
+type ProcStat struct {
+	PID    int32   `json:"pid"`
+	Name   string  `json:"name"`
+	CPUPct float64 `json:"cpu_pct"`
+	MemPct float64 `json:"mem_pct"`
+	RSS    uint64  `json:"rss"`
 }
 
 type LoadStats struct {

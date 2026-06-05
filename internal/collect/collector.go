@@ -19,14 +19,16 @@ type Sampler struct {
 	disk DiskCollector
 	net  *NetCollector
 	fs   *FSCollector
+	proc *ProcCollector
 }
 
 func NewSampler(cfg config.Config) *Sampler {
 	return &Sampler{
-		C:   make(chan Snapshot, 4),
-		cfg: cfg,
-		net: NewNetCollector(cfg.Collect.NetExclude),
-		fs:  NewFSCollector(cfg.Collect.FSInclude),
+		C:    make(chan Snapshot, 4),
+		cfg:  cfg,
+		net:  NewNetCollector(cfg.Collect.NetExclude),
+		fs:   NewFSCollector(cfg.Collect.FSInclude),
+		proc: NewProcCollector(cfg.Collect.TopProcs),
 	}
 }
 
@@ -38,6 +40,7 @@ func (s *Sampler) Run(ctx context.Context) {
 	s.cpu.Collect()
 	s.disk.Collect()
 	s.net.Collect()
+	s.proc.Collect()
 	time.Sleep(s.cfg.Collect.Interval.Duration)
 
 	for {
@@ -67,6 +70,7 @@ func (s *Sampler) collect(t time.Time) Snapshot {
 		Net:    s.net.Collect(),
 		FS:     s.fs.Collect(),
 		Temps:  collectTemps(),
+		Procs:  s.proc.Collect(),
 		Uptime: uptime,
 	}
 	if load != nil {

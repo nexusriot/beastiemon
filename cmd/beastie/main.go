@@ -190,6 +190,25 @@ func printTemps(snap collect.Snapshot) {
 	}
 }
 
+func printProcs(snap collect.Snapshot) {
+	if len(snap.Procs) == 0 {
+		fmt.Println(gray + "PROC    (no data — needs two samples)" + reset)
+		return
+	}
+	fmt.Printf(bold+"PROC"+reset+gray+"    %-7s %6s %6s %10s  %s\n"+reset,
+		"PID", "CPU%", "MEM%", "RSS", "COMMAND")
+	for _, p := range snap.Procs {
+		col := green
+		if p.CPUPct >= 90 {
+			col = red
+		} else if p.CPUPct >= 50 {
+			col = yellow
+		}
+		fmt.Printf("        %-7d %s%6.1f%s %6.1f %10s  %s\n",
+			p.PID, col, p.CPUPct, reset, p.MemPct, humanBytes(p.RSS), p.Name)
+	}
+}
+
 func printLoad(snap collect.Snapshot) {
 	l := snap.Load
 	col1 := green
@@ -215,6 +234,7 @@ func printAll(snap collect.Snapshot) {
 	printTemps(snap)
 	printLoad(snap)
 	printUptime(snap)
+	printProcs(snap)
 }
 
 // collectOnce uses the sampler to get a single snapshot with deltas warmed up.
@@ -245,6 +265,7 @@ func usage() {
 	fmt.Printf("  %-10s  %s\n", "disk", "disk I/O throughput")
 	fmt.Printf("  %-10s  %s\n", "fs", "filesystem usage")
 	fmt.Printf("  %-10s  %s\n", "temp", "sensor temperatures")
+	fmt.Printf("  %-10s  %s\n", "proc", "top processes by CPU")
 	fmt.Printf("  %-10s  %s\n", "top", "continuous refresh (Ctrl-C to quit)")
 	fmt.Printf("  %-10s  %s\n", "version", "print version")
 	fmt.Println()
@@ -322,6 +343,8 @@ func main() {
 			printFS(snap)
 		case "temp":
 			printTemps(snap)
+		case "proc":
+			printProcs(snap)
 		case "load":
 			printLoad(snap)
 		default: // status
