@@ -20,7 +20,7 @@ import (
 	"github.com/nexusriot/beastiemon/internal/config"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 // ANSI colour helpers. These are vars, not consts, so applyColor() can blank
 // them when output isn't a terminal (or NO_COLOR / --no-color is set).

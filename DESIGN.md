@@ -1092,12 +1092,12 @@ because the path doesn't exist in the stage tree.
 ### Makefile pipeline
 
 ```
-$ gmake VERSION=0.1.0 pkg
+$ gmake VERSION=0.2.0 pkg
    ├── deps          (go mod download / tidy)
    ├── vendor-js     (download uPlot, rewrite index.html, patch assets.go)
    ├── build         (GOOS=freebsd GOARCH=amd64; produces beastied, beastie)
    ├── stage         (lay out .stage/ with bins, rc.d, conf.sample)
-   └── pkg           (pkg create --format txz → .pkg/beastiemon-0.1.0.pkg)
+   └── pkg           (pkg create --format txz → .pkg/beastiemon-0.2.0.pkg)
 ```
 
 ### Install paths

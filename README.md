@@ -65,7 +65,7 @@ web UI and a colourful CLI.**
 If you already have a built `.pkg`:
 
 ```sh
-pkg install ./beastiemon-0.1.0.pkg
+pkg install ./beastiemon-0.2.0.pkg
 sysrc beastied_enable=YES
 service beastied start
 ```
@@ -130,7 +130,7 @@ Override `VERSION`, `PREFIX`, `GOOS`, `GOARCH`, or `DESTDIR` on the
 command line:
 
 ```sh
-gmake VERSION=0.2.0 GOARCH=arm64 pkg
+gmake VERSION=0.3.0 GOARCH=arm64 pkg
 gmake PREFIX=/opt/beastiemon DESTDIR=/tmp/root install
 ```
 
@@ -138,7 +138,7 @@ gmake PREFIX=/opt/beastiemon DESTDIR=/tmp/root install
 
 ```sh
 gmake run
-# beastied 0.1.0 listening on 127.0.0.1:8088
+# beastied 0.2.0 listening on 127.0.0.1:8088
 ```
 
 The binary stays in the foreground; `Ctrl-C` to stop. Web assets are
@@ -152,14 +152,14 @@ serving needed.
 On a FreeBSD host (or anywhere with `pkg-create`):
 
 ```sh
-gmake VERSION=0.1.0 pkg
-# .pkg/beastiemon-0.1.0.pkg
+gmake VERSION=0.2.0 pkg
+# .pkg/beastiemon-0.2.0.pkg
 ```
 
 Inspect before installing:
 
 ```sh
-pkg info -F .pkg/beastiemon-0.1.0.pkg
+pkg info -F .pkg/beastiemon-0.2.0.pkg
 ```
 
 ---
@@ -169,7 +169,7 @@ pkg info -F .pkg/beastiemon-0.1.0.pkg
 ### From the built package
 
 ```sh
-pkg install ./.pkg/beastiemon-0.1.0.pkg
+pkg install ./.pkg/beastiemon-0.2.0.pkg
 ```
 
 The package install does the following automatically:
@@ -406,7 +406,7 @@ $ beastie
 <----.     '__\
 <----|====O)))==)
 <----'    `--'
-    BeastieMon v0.1.0  — FreeBSD system monitor
+    BeastieMon v0.2.0  — FreeBSD system monitor
 
 Host: monitor.local  OS: freebsd 14.0-RELEASE
 
