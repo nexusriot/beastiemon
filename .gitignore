@@ -24,3 +24,8 @@
 *.test
 *.out
 coverage.*
+*.prof
+
+# Local Go workspace files (developer-specific, never shipped)
+go.work
+go.work.sum
