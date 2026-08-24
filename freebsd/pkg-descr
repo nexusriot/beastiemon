@@ -1,10 +1,19 @@
 BeastieMon — lightweight FreeBSD system monitoring daemon.
 
-Collects CPU, memory, disk I/O, network, filesystem, and temperature
-metrics every second and serves them through a self-contained web
-dashboard with live graphs (uPlot) and a command-line tool (beastie).
+Collects CPU, memory, disk I/O, network, filesystem, temperature, load,
+and top-process metrics every second — plus optional ZFS pool/ARC and
+jail panels — and serves them through a self-contained web dashboard
+with live graphs (uPlot), a Prometheus /metrics exporter, and a
+command-line tool (beastie) that samples standalone or reads the
+running daemon (--remote), including a nagios-style check mode.
 
-No authentication — bind to localhost and proxy through nginx/haproxy
-if LAN or TLS access is required.
+Optional SQLite history widens the dashboard beyond the in-memory hour
+(tiered to hourly roll-ups past a week); optional threshold alerts POST
+webhooks (raw/Slack/Discord), with a sampler watchdog, a rule-state API
+(/api/alerts), and an Alerts dashboard card.
 
-WWW: https://github.com/yourorg/beastiemon
+Authentication is optional (HTTP Basic and/or a bearer token, off by
+default) and there is no TLS: bind to localhost and proxy through
+nginx/haproxy for LAN or TLS access.
+
+WWW: https://github.com/nexusriot/beastiemon

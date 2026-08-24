@@ -14,6 +14,23 @@
   --card-r:   8px;
 }
 
+/* Light theme: set data-theme="light" on <html>. app.js picks the initial
+   value from localStorage, falling back to prefers-color-scheme. */
+:root[data-theme="light"] {
+  --bg:     #ffffff;
+  --bg2:    #f6f8fa;
+  --bg3:    #eaeef2;
+  --border: #d0d7de;
+  --text:   #1f2328;
+  --muted:  #656d76;
+  --red:    #cf222e;
+  --orange: #9a6700;
+  --green:  #1a7f37;
+  --blue:   #0969da;
+  --purple: #8250df;
+  --cyan:   #1b7c83;
+}
+
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 html, body {
@@ -66,6 +83,25 @@ header {
 }
 
 .meta { color: var(--muted); font-size: 12px; }
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.theme-toggle {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+
+.theme-toggle:hover { color: var(--text); border-color: var(--blue); }
 
 .range-picker {
   display: flex;
@@ -295,6 +331,42 @@ main { padding: 20px 24px; }
 .proc-cpu  { color: var(--green); font-weight: 600; }
 .proc-cpu.warn { color: var(--orange); }
 .proc-cpu.crit { color: var(--red); }
+
+.alert-badge {
+  display: inline-block;
+  padding: 0 8px;
+  border: 1px solid;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.alert-ok      { color: var(--green);  border-color: var(--green); }
+.alert-pending { color: var(--orange); border-color: var(--orange); }
+.alert-firing  { color: var(--red);    border-color: var(--red); }
+
+.alerts-events-title {
+  margin-top: 12px;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.alert-event {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.alert-event .ev-time  { color: var(--muted); flex-shrink: 0; }
+.alert-event .ev-state { width: 70px; flex-shrink: 0; font-weight: 600; }
+.alert-event .ev-state.firing   { color: var(--red); }
+.alert-event .ev-state.resolved { color: var(--green); }
+.alert-event .ev-what { color: var(--text); }
 
 @media (max-width: 1100px) {
   .grid { grid-template-columns: repeat(2, 1fr); }

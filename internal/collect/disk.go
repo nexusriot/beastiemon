@@ -7,8 +7,8 @@ import (
 )
 
 type DiskCollector struct {
-	prev    map[string]psutil.IOCountersStat
-	prevAt  time.Time
+	prev   map[string]psutil.IOCountersStat
+	prevAt time.Time
 }
 
 func (d *DiskCollector) Collect() []DiskStats {
@@ -31,10 +31,10 @@ func (d *DiskCollector) Collect() []DiskStats {
 			}
 			stats = append(stats, DiskStats{
 				Device:    name,
-				ReadBps:   round2(float64(cur.ReadBytes-p.ReadBytes) / dt),
-				WriteBps:  round2(float64(cur.WriteBytes-p.WriteBytes) / dt),
-				ReadIOPS:  round2(float64(cur.ReadCount-p.ReadCount) / dt),
-				WriteIOPS: round2(float64(cur.WriteCount-p.WriteCount) / dt),
+				ReadBps:   round2(deltaU64(cur.ReadBytes, p.ReadBytes) / dt),
+				WriteBps:  round2(deltaU64(cur.WriteBytes, p.WriteBytes) / dt),
+				ReadIOPS:  round2(deltaU64(cur.ReadCount, p.ReadCount) / dt),
+				WriteIOPS: round2(deltaU64(cur.WriteCount, p.WriteCount) / dt),
 			})
 		}
 	}

@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
+	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -16,10 +20,11 @@ import (
 	"github.com/nexusriot/beastiemon/internal/config"
 )
 
-var version = "0.1.0"
+var version = "0.2.0"
 
-// ANSI colour helpers
-const (
+// ANSI colour helpers. These are vars, not consts, so applyColor() can blank
+// them when output isn't a terminal (or NO_COLOR / --no-color is set).
+var (
 	reset  = "\033[0m"
 	bold   = "\033[1m"
 	red    = "\033[31m"
@@ -30,26 +35,35 @@ const (
 	gray   = "\033[90m"
 )
 
-// FreeBSD Beastie — trident rendered in red, body in default.
-var beastieLines = []string{
-	red + `    ,        ,` + reset,
-	red + `   /(        )` + "`" + reset,
-	red + `   \ \___   / |` + reset,
-	red + `   /- _  ` + "`" + `-/  '` + reset,
-	red + `  (/\/ \ \   /\` + reset,
-	red + `  / /   | ` + "`" + `   /` + reset,
-	`  ` + red + `O` + reset + ` ` + red + `O` + reset + `   ) /   |`,
-	red + "  `-^--'" + "`" + `<     '` + reset,
-	gray + ` (_.)  _  )   /` + reset,
-	gray + `  ` + "`" + `.___/` + "`" + `    /` + reset,
-	gray + `    ` + "`" + `-----' /` + reset,
-	red + `<----.     '__\` + reset,
-	red + `<----|====O)))==)` + reset,
-	red + `<----'    ` + "`" + `--'` + reset,
+// showBanner gates the mascot; false when stdout isn't a terminal.
+var showBanner = true
+
+// bannerLines builds the Beastie mascot using the current colour vars, so it
+// reflects applyColor()'s decision (trident in red, body default/grey).
+func bannerLines() []string {
+	return []string{
+		red + `    ,        ,` + reset,
+		red + `   /(        )` + "`" + reset,
+		red + `   \ \___   / |` + reset,
+		red + `   /- _  ` + "`" + `-/  '` + reset,
+		red + `  (/\/ \ \   /\` + reset,
+		red + `  / /   | ` + "`" + `   /` + reset,
+		`  ` + red + `O` + reset + ` ` + red + `O` + reset + `   ) /   |`,
+		red + "  `-^--'" + "`" + `<     '` + reset,
+		gray + ` (_.)  _  )   /` + reset,
+		gray + `  ` + "`" + `.___/` + "`" + `    /` + reset,
+		gray + `    ` + "`" + `-----' /` + reset,
+		red + `<----.     '__\` + reset,
+		red + `<----|====O)))==)` + reset,
+		red + `<----'    ` + "`" + `--'` + reset,
+	}
 }
 
 func printBanner() {
-	for _, l := range beastieLines {
+	if !showBanner {
+		return
+	}
+	for _, l := range bannerLines() {
 		fmt.Println(l)
 	}
 	fmt.Printf(bold+cyan+"    BeastieMon v%s"+reset+"  — FreeBSD system monitor\n\n", version)
@@ -104,7 +118,7 @@ func printCPU(snap collect.Snapshot) {
 		cyan, c.User, reset, yellow, c.Sys, reset, gray, c.Idle, reset)
 
 	if len(c.PerCore) > 0 {
-		fmt.Printf(gray + "        cores: " + reset)
+		fmt.Print(gray + "        cores: " + reset)
 		for i, v := range c.PerCore {
 			col := green
 			if v >= 90 {
@@ -237,9 +251,51 @@ func printAll(snap collect.Snapshot) {
 	printProcs(snap)
 }
 
+// emitJSON prints the part of the snapshot relevant to cmd as indented JSON.
+// Sub-objects reuse the same struct tags as the daemon's /api/metrics, so
+// CLI and API output are byte-identical for a given metric.
+func emitJSON(cmd string, snap collect.Snapshot) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	switch cmd {
+	case "cpu":
+		enc.Encode(snap.CPU)
+	case "mem":
+		enc.Encode(snap.Mem)
+	case "net":
+		enc.Encode(snap.Net)
+	case "disk":
+		enc.Encode(snap.Disk)
+	case "fs":
+		enc.Encode(snap.FS)
+	case "temp":
+		enc.Encode(snap.Temps)
+	case "proc":
+		enc.Encode(snap.Procs)
+	case "load":
+		enc.Encode(snap.Load)
+	default: // status
+		enc.Encode(snap)
+	}
+}
+
+// collectTimeout bounds collectOnce. The sampler sleeps one full interval to
+// warm its delta-based collectors before the first snapshot, so the timeout
+// must scale with the configured interval — a fixed bound shorter than the
+// interval would make every command silently report zeros.
+func collectTimeout(interval time.Duration) time.Duration {
+	t := 2*interval + 2*time.Second
+	if t < 5*time.Second {
+		t = 5 * time.Second
+	}
+	return t
+}
+
 // collectOnce uses the sampler to get a single snapshot with deltas warmed up.
-func collectOnce(cfg config.Config) collect.Snapshot {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+// ok is false when collection timed out and the snapshot is empty.
+func collectOnce(cfg config.Config) (collect.Snapshot, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(),
+		collectTimeout(cfg.Collect.Interval.Duration))
 	defer cancel()
 
 	sampler := collect.NewSampler(cfg)
@@ -247,15 +303,208 @@ func collectOnce(cfg config.Config) collect.Snapshot {
 
 	select {
 	case snap := <-sampler.C:
-		return snap
+		return snap, true
 	case <-ctx.Done():
-		return collect.Snapshot{Time: time.Now()}
+		return collect.Snapshot{Time: time.Now()}, false
 	}
+}
+
+// snapshotFn produces one snapshot: local sampling or a remote daemon fetch.
+type snapshotFn func() (collect.Snapshot, error)
+
+// mustSnap runs get for the human-facing commands: on failure it still
+// returns the (empty) snapshot but warns on stderr instead of printing
+// all-zero metrics as if they were real.
+func mustSnap(get snapshotFn) collect.Snapshot {
+	snap, err := get()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "beastie: %v; output may be empty\n", err)
+	}
+	return snap
+}
+
+// remoteBase resolves the -remote flag value to an HTTP client and base URL.
+// Accepted forms: "auto" (use server.listen from the config), an absolute
+// path (beastied's Unix socket), host:port, or a full http(s) URL.
+func remoteBase(cfg config.Config, target string) (*http.Client, string, error) {
+	if target == "auto" {
+		target = cfg.Server.Listen
+		if target == "" {
+			return nil, "", errors.New("remote auto: no server.listen in config")
+		}
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	switch {
+	case strings.HasPrefix(target, "/"):
+		sock := target
+		client.Transport = &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+			},
+		}
+		// The host part is a placeholder; the transport dials the socket.
+		return client, "http://beastied", nil
+	case strings.HasPrefix(target, "http://"), strings.HasPrefix(target, "https://"):
+		return client, strings.TrimSuffix(target, "/"), nil
+	default:
+		return client, "http://" + target, nil
+	}
+}
+
+// fetchRemote reads the latest snapshot from a running beastied's
+// /api/metrics, authenticating with the config's token (or basic
+// credentials). Unlike local sampling it returns instantly — the daemon's
+// deltas are already warm.
+func fetchRemote(cfg config.Config, target string) (collect.Snapshot, error) {
+	client, base, err := remoteBase(cfg, target)
+	if err != nil {
+		return collect.Snapshot{}, err
+	}
+	req, err := http.NewRequest(http.MethodGet, base+"/api/metrics", nil)
+	if err != nil {
+		return collect.Snapshot{}, err
+	}
+	if cfg.Auth.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Auth.Token)
+	} else if cfg.Auth.BasicEnabled() {
+		req.SetBasicAuth(cfg.Auth.Username, cfg.Auth.Password)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return collect.Snapshot{}, fmt.Errorf("remote %s: %w", target, err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusServiceUnavailable:
+		return collect.Snapshot{}, errors.New("remote: daemon has no data yet")
+	case http.StatusUnauthorized:
+		return collect.Snapshot{}, errors.New("remote: unauthorized (set [auth] token or username/password in the config)")
+	default:
+		return collect.Snapshot{}, fmt.Errorf("remote: HTTP %d", resp.StatusCode)
+	}
+	var snap collect.Snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+		return collect.Snapshot{}, fmt.Errorf("remote: bad response: %w", err)
+	}
+	return snap, nil
+}
+
+// isTerminal reports whether f is a character device (a TTY). Used to decide
+// colour/banner; works on FreeBSD/Linux with no extra dependency.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// wantColor decides whether ANSI colour should be emitted: only on a terminal,
+// and never when NO_COLOR (see no-color.org) or --no-color is set.
+func wantColor(isTTY bool, noColorEnv string, noColorFlag bool) bool {
+	if noColorFlag || noColorEnv != "" {
+		return false
+	}
+	return isTTY
+}
+
+// applyColor(false) blanks every colour escape so output is plain text.
+func applyColor(on bool) {
+	if on {
+		return
+	}
+	reset, bold, red, green, yellow, cyan, white, gray = "", "", "", "", "", "", "", ""
+}
+
+// checkValue returns the scalar `beastie check` compares against thresholds,
+// plus a short label. Higher is "worse" for every supported metric.
+func checkValue(snap collect.Snapshot, metric string) (float64, string, bool) {
+	switch metric {
+	case "cpu":
+		return snap.CPU.Total, "cpu.total%", true
+	case "mem":
+		return snap.Mem.UsedPct, "mem.used%", true
+	case "swap":
+		return snap.Mem.SwapPct, "swap.used%", true
+	case "load":
+		return snap.Load.Load1, "load1", true
+	case "fs":
+		var max float64
+		for _, f := range snap.FS {
+			if f.UsedPct > max {
+				max = f.UsedPct
+			}
+		}
+		return max, "fs.max_used%", true
+	case "temp":
+		var max float64
+		for _, t := range snap.Temps {
+			if t.Celsius > max {
+				max = t.Celsius
+			}
+		}
+		return max, "temp.max_c", true
+	case "net":
+		var sum float64
+		for _, n := range snap.Net {
+			sum += n.RxBps + n.TxBps
+		}
+		return sum, "net.total_bps", true
+	case "disk":
+		var sum float64
+		for _, d := range snap.Disk {
+			sum += d.ReadBps + d.WriteBps
+		}
+		return sum, "disk.total_bps", true
+	}
+	return 0, "", false
+}
+
+// evalCheck applies nagios threshold semantics; thresholds <= 0 are "unset".
+func evalCheck(val, warn, crit float64) (string, int) {
+	if crit > 0 && val >= crit {
+		return "CRITICAL", 2
+	}
+	if warn > 0 && val >= warn {
+		return "WARNING", 1
+	}
+	return "OK", 0
+}
+
+// runCheck implements `beastie check [--warn N] [--crit N] <metric>`: it prints
+// one nagios plugin line with perfdata and exits 0/1/2 (3 = UNKNOWN). Output
+// is always plain text (no banner/colour) so it drops into monitoring cleanly.
+func runCheck(getSnap snapshotFn, args []string) {
+	fs := flag.NewFlagSet("check", flag.ContinueOnError)
+	warn := fs.Float64("warn", 0, "warning threshold")
+	crit := fs.Float64("crit", 0, "critical threshold")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(3)
+	}
+	metric := fs.Arg(0)
+	if metric == "" {
+		fmt.Println("UNKNOWN: check needs a metric (cpu|mem|swap|load|fs|temp|net|disk)")
+		os.Exit(3)
+	}
+	snap, err := getSnap()
+	if err != nil {
+		fmt.Printf("UNKNOWN: %v\n", err)
+		os.Exit(3)
+	}
+	val, label, ok := checkValue(snap, metric)
+	if !ok {
+		fmt.Printf("UNKNOWN: unknown metric %q\n", metric)
+		os.Exit(3)
+	}
+	status, code := evalCheck(val, *warn, *crit)
+	fmt.Printf("%s: %s = %.2f | value=%.2f;%.0f;%.0f\n", status, label, val, val, *warn, *crit)
+	os.Exit(code)
 }
 
 func usage() {
 	printBanner()
-	fmt.Println(bold + "Usage:" + reset + "  beastie [command]")
+	fmt.Println(bold + "Usage:" + reset + "  beastie [flags] [command]")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Printf("  %-10s  %s\n", "status", "show all metrics (default)")
@@ -266,21 +515,58 @@ func usage() {
 	fmt.Printf("  %-10s  %s\n", "fs", "filesystem usage")
 	fmt.Printf("  %-10s  %s\n", "temp", "sensor temperatures")
 	fmt.Printf("  %-10s  %s\n", "proc", "top processes by CPU")
+	fmt.Printf("  %-10s  %s\n", "load", "load average")
 	fmt.Printf("  %-10s  %s\n", "top", "continuous refresh (Ctrl-C to quit)")
+	fmt.Printf("  %-10s  %s\n", "check", "nagios-style threshold check (exit 0/1/2/3)")
 	fmt.Printf("  %-10s  %s\n", "version", "print version")
 	fmt.Println()
-	fmt.Printf(gray + "Web UI runs via beastied on http://127.0.0.1:8088/" + reset + "\n")
+	fmt.Println(bold + "Flags:" + reset)
+	fmt.Printf("  %-16s  %s\n", "-config <path>", "config file (default /usr/local/etc/beastiemon.conf)")
+	fmt.Printf("  %-16s  %s\n", "--json", "emit JSON instead of coloured text (NDJSON for top)")
+	fmt.Printf("  %-16s  %s\n", "--no-color", "disable ANSI colour and the banner")
+	fmt.Printf("  %-16s  %s\n", "--remote <addr>", "read from a running beastied: \"auto\", host:port, URL, or socket path")
+	fmt.Println(gray + "  (flags must precede the command; colour also auto-off when piped)" + reset)
+	fmt.Println()
+	fmt.Println(bold + "Check:" + reset + "  beastie check [--warn N] [--crit N] <cpu|mem|swap|load|fs|temp|net|disk>")
+	fmt.Println()
+	fmt.Print(gray + "Web UI runs via beastied on http://127.0.0.1:8088/" + reset + "\n")
 }
 
 func main() {
 	cfgPath := flag.String("config", "/usr/local/etc/beastiemon.conf", "config file")
+	jsonOut := flag.Bool("json", false, "emit JSON instead of coloured text")
+	noColor := flag.Bool("no-color", false, "disable ANSI colour and the banner")
+	remote := flag.String("remote", "",
+		`read metrics from a running beastied instead of sampling locally: "auto" (use server.listen from config), host:port, URL, or a Unix socket path`)
 	flag.Usage = usage
 	flag.Parse()
+
+	// Colour + banner: on only for an interactive terminal, and never when
+	// NO_COLOR or --no-color is set. Keeps pipes/files/less free of escapes.
+	tty := isTerminal(os.Stdout)
+	if !wantColor(tty, os.Getenv("NO_COLOR"), *noColor) {
+		applyColor(false)
+	}
+	showBanner = tty && !*noColor
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(1)
+	}
+
+	// getSnap is the single snapshot source every command shares: remote
+	// fetch when -remote is set (instant — the daemon's deltas are warm),
+	// else one local sampling pass.
+	getSnap := func() (collect.Snapshot, error) {
+		if *remote != "" {
+			return fetchRemote(cfg, *remote)
+		}
+		snap, ok := collectOnce(cfg)
+		if !ok {
+			return snap, errors.New("metric collection timed out")
+		}
+		return snap, nil
 	}
 
 	cmd := flag.Arg(0)
@@ -290,14 +576,32 @@ func main() {
 
 	switch cmd {
 	case "version":
-		fmt.Printf("beastie %s\n", version)
+		if *jsonOut {
+			json.NewEncoder(os.Stdout).Encode(map[string]string{"version": version})
+		} else {
+			fmt.Printf("beastie %s\n", version)
+		}
 		return
 
 	case "help", "-h", "--help":
 		usage()
 		return
 
+	case "check":
+		runCheck(getSnap, flag.Args()[1:])
+		return
+
 	case "top":
+		if *jsonOut {
+			// Stream one compact JSON snapshot per interval (NDJSON).
+			enc := json.NewEncoder(os.Stdout)
+			for {
+				if snap, err := getSnap(); err == nil {
+					enc.Encode(snap)
+				}
+				time.Sleep(cfg.Collect.Interval.Duration)
+			}
+		}
 		printBanner()
 		host, _ := psutil_host.Info()
 		if host != nil {
@@ -305,7 +609,7 @@ func main() {
 				host.Hostname, host.OS, host.PlatformVersion)
 		}
 		for {
-			snap := collectOnce(cfg)
+			snap := mustSnap(getSnap)
 			// Move cursor up to overwrite previous output (14 lines max).
 			fmt.Print("\033[2J\033[H") // clear screen
 			printBanner()
@@ -320,6 +624,11 @@ func main() {
 		}
 
 	default:
+		if *jsonOut {
+			emitJSON(cmd, mustSnap(getSnap))
+			return
+		}
+
 		printBanner()
 
 		host, _ := psutil_host.Info()
@@ -328,7 +637,7 @@ func main() {
 				host.Hostname, host.OS, host.PlatformVersion)
 		}
 
-		snap := collectOnce(cfg)
+		snap := mustSnap(getSnap)
 
 		switch cmd {
 		case "cpu":

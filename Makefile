@@ -1,4 +1,4 @@
-VERSION  ?= 0.1.0
+VERSION  ?= 0.2.0
 PREFIX   ?= /usr/local
 DESTDIR  ?=
 GOOS     ?= freebsd
@@ -66,6 +66,9 @@ stage: build
 	chmod 0755 $(STAGE)$(PREFIX)/etc/rc.d/beastied
 	install -m 0644 freebsd/beastiemon.conf \
 	    $(STAGE)$(PREFIX)/etc/beastiemon.conf.sample
+	install -d $(STAGE)$(PREFIX)/etc/newsyslog.conf.d
+	install -m 0644 freebsd/newsyslog.conf \
+	    $(STAGE)$(PREFIX)/etc/newsyslog.conf.d/beastied.conf
 	# /var/log is a base-system dir; the rc.d script creates the log file at runtime.
 
 install: stage

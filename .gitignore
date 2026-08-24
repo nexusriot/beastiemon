@@ -1,1 +1,26 @@
+# Editors / IDEs
 .idea/
+.vscode/
+*.swp
+*~
+
+# OS cruft
+.DS_Store
+
+# Compiled binaries (the Makefile builds these into the repo root)
+/beastied
+/beastie
+
+# Build & packaging output (Makefile STAGE / PKGDIR)
+/.stage/
+/.pkg/
+
+# uPlot fetched by `gmake vendor-js` — reproducibly re-downloaded, not tracked.
+# (See DESIGN.md §9. Keep the committed assets.go/index.html on their CDN
+#  defaults so a plain `go build` works without this directory.)
+/web/vendor/
+
+# Go test & coverage artifacts
+*.test
+*.out
+coverage.*

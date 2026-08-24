@@ -3,22 +3,26 @@ version: "%%VERSION%%"
 origin: sysutils/beastiemon
 comment: Lightweight FreeBSD system monitor with web UI and CLI
 maintainer: you@example.org
-www: https://github.com/yourorg/beastiemon
+www: https://github.com/nexusriot/beastiemon
 prefix: /usr/local
 desc: <<EOD
-BeastieMon collects host metrics (CPU, memory, disk, network, temperature)
-on FreeBSD and serves a self-contained web dashboard with live graphs.
-A CLI companion (beastie) provides colourised terminal output.
+BeastieMon collects host metrics (CPU, memory, disk, network, filesystem,
+temperature, processes; optional ZFS and jails) on FreeBSD and serves a
+self-contained web dashboard with live graphs, a Prometheus exporter,
+optional SQLite history, and optional threshold alerts with webhooks.
+A CLI companion (beastie) provides colourised terminal output, remote
+daemon queries, and a nagios-style check mode.
 EOD
 categories: [sysutils]
 licenselogic: single
-licenses: [BSD2CLAUSE]
+licenses: [MIT]
 
 files: {
   /usr/local/bin/beastied: "-",
   /usr/local/bin/beastie: "-",
   /usr/local/etc/rc.d/beastied: "-",
   /usr/local/etc/beastiemon.conf.sample: "-",
+  /usr/local/etc/newsyslog.conf.d/beastied.conf: "-",
 }
 
 scripts: {

@@ -49,14 +49,22 @@ For build & operate instructions, see [README.md](README.md).
 
 ### Non-Goals
 
-- **No authentication.** Bind to `127.0.0.1`; let nginx / Caddy add auth and TLS.
-- **No long-term storage.** Ring buffer holds one hour; export to Prometheus / Influx if you want history.
-- **No alerting / rule engine.** Threshold gates can be added later (see §19).
+- **No mandatory auth, no TLS.** Authentication is opt-in via `[auth]`
+  (off by default); TLS is always the reverse proxy's job. Bind to
+  `127.0.0.1` and front with nginx / Caddy for anything untrusted.
+- **No long-term storage *by default*.** The ring holds one hour in RAM.
+  Opt into `[store]` for bounded SQLite history, or scrape `/metrics` into
+  Prometheus / Influx for real retention — the daemon itself is not a TSDB.
+- **No complex rule engine.** `[alerts]` covers simple sustained
+  threshold → webhook; anything richer (correlation, flapping suppression,
+  routing) belongs in Alertmanager downstream of `/metrics`.
 - **Not a fleet tool.** One daemon, one host. Federation is the operator's job.
 - **No multi-tenancy.** Single dashboard, no per-user views.
 
 The non-goals exist on purpose. They are what keeps the binary small,
-the surface area auditable, and the operational complexity near zero.
+the surface area auditable, and the operational complexity near zero. The
+optional subsystems (`[auth]`, `[store]`, `[alerts]`, ZFS/jails) are all
+off by default, so a default install stays exactly as lean as before.
 
 ---
 
@@ -87,8 +95,9 @@ the surface area auditable, and the operational complexity near zero.
 │                              │   /api/host                   │         │
 │                              │   /api/metrics  (Last)        │         │
 │                              │   /api/series   (Since + xfm) │         │
-│                              │   /api/stream   (SSE)         │         │
-│                              │   /healthz                    │         │
+│                              │   /api/alerts   (rule states) │         │
+│                              │   /api/stream   (SSE)  /api/ws│         │
+│                              │   /metrics (Prom)  /healthz   │         │
 │                              │   /  → embed.FS (web/)        │         │
 │                              └─────────────┬─────────────────┘         │
 │                                            │                           │
@@ -102,8 +111,9 @@ the surface area auditable, and the operational complexity near zero.
                               ┌──────────────┴──────────────┐
                               ▼                             ▼
                        Browser (uPlot)               beastie CLI
-                       SSE → live charts             (uses collect/ pkg
-                       fetch /api/series             directly, no API)
+                       SSE → live charts             (samples collect/ pkg
+                       fetch /api/series             directly; --remote
+                                                     reads /api/metrics)
                                                        │
                                                        ▼
                                                        host metrics
@@ -115,14 +125,15 @@ the surface area auditable, and the operational complexity near zero.
 The repository ships:
 
 - **`beastied`** — long-running daemon. Owns the sampler, ring, HTTP server.
-- **`beastie`** — CLI tool. **Bypasses the HTTP API entirely** and samples
-  the host directly via the same `internal/collect` package. This means
-  the CLI works even when `beastied` isn't running — important when you
-  SSH into a sick box at 3am.
+- **`beastie`** — CLI tool. **By default it bypasses the HTTP API entirely**
+  and samples the host directly via the same `internal/collect` package, so
+  the CLI works even when `beastied` isn't running — important when you SSH
+  into a sick box at 3am. With `--remote` it instead reads the running
+  daemon's `/api/metrics` (instant, warm deltas — §10, D20).
 
 This is the single most important architectural choice: the collector
-package is the contract, not the HTTP API. The API is just one of two
-front-ends to the same data source.
+package is the contract, not the HTTP API. The API is one of two front-ends
+to the same data source — and the CLI can consume either.
 
 ---
 
@@ -135,9 +146,9 @@ beastiemon/
 │   └── beastie/main.go              # CLI entrypoint (Beastie ASCII, colour bars)
 ├── internal/
 │   ├── config/
-│   │   └── config.go                # TOML decoder, defaults, duration shim
+│   │   └── config.go                # TOML decoder, defaults, duration shim, value clamping
 │   ├── collect/
-│   │   ├── types.go                 # Snapshot, CPUStats, MemStats, … (wire schema)
+│   │   ├── types.go                 # Snapshot, CPUStats, … (wire schema; +ZFS/ARC/Jail)
 │   │   ├── collector.go             # Sampler — orchestrates per-tick collection
 │   │   ├── cpu.go                   # per-core delta CPU times
 │   │   ├── mem.go                   # virtual+swap memory
@@ -146,27 +157,38 @@ beastiemon/
 │   │   ├── fs.go                    # statfs(2) per mount, filtered
 │   │   ├── temp.go                  # FreeBSD-only sysctl thermometers
 │   │   ├── temp_other.go            # stub for non-FreeBSD builds
-│   │   └── proc.go                  # top-N processes by CPU%
+│   │   ├── proc.go                  # top-N processes by CPU%
+│   │   ├── zfs.go / zfs_other.go    # FreeBSD-only ZFS pool + ARC (zpool + kstat)
+│   │   ├── jail.go / jail_other.go  # FreeBSD-only jail enumeration (jls + ps)
+│   │   └── bsdextra_parse.go        # pure parsers for zfs/jail (unit-tested anywhere)
 │   ├── store/
-│   │   └── ring.go                  # in-memory circular buffer of Snapshots
+│   │   ├── ring.go                  # in-memory circular buffer of Snapshots
+│   │   ├── sqlite.go                # optional on-disk history (pure-Go SQLite; coarse tier, alert events)
+│   │   └── rollup.go                # per-bucket avg/min/max aggregation
+│   ├── alert/
+│   │   └── alert.go                 # threshold rule engine + webhook, states/events, watchdog
 │   └── api/
-│       └── server.go                # HTTP handlers + SSE broker
+│       ├── server.go                # HTTP handlers + SSE/WS broker + auth gate + /api/alerts
+│       ├── prometheus.go            # /metrics text exposition
+│       └── *_test.go                # auth, series, alerts, prometheus, websocket tests
 ├── web/                             # embedded via //go:embed
 │   ├── assets.go                    # embed.FS declaration
 │   ├── index.html                   # dashboard scaffold
-│   ├── app.js                       # uPlot wiring + SSE consumer
-│   ├── style.css                    # dark theme
+│   ├── app.js                       # uPlot wiring + SSE consumer + theme toggle
+│   ├── style.css                    # dark + light themes
 │   └── vendor/                      # populated by `gmake vendor-js`
 │       ├── uplot.iife.min.js
 │       └── uplot.min.css
 ├── freebsd/                         # packaging
 │   ├── beastied.in                  # rc.d template (%%PREFIX%% substituted)
 │   ├── beastiemon.conf              # default config
+│   ├── newsyslog.conf               # log-rotation rule (→ newsyslog.conf.d/)
 │   ├── +MANIFEST                    # pkg(8) manifest (%%VERSION%% substituted)
 │   └── pkg-descr
 ├── Makefile                         # build / vendor / stage / pkg / install
 ├── go.mod
 ├── go.sum
+├── LICENSE                          # MIT
 ├── DESIGN.md                        # this file
 └── README.md                        # user docs
 ```
@@ -193,6 +215,9 @@ type Snapshot struct {
     FS     []FSStats   `json:"fs"`
     Temps  []TempStat  `json:"temps,omitempty"`
     Procs  []ProcStat  `json:"procs,omitempty"`
+    ZFS    []ZFSStats  `json:"zfs,omitempty"`   // FreeBSD, opt-in
+    ARC    *ARCStats   `json:"arc,omitempty"`   // FreeBSD, opt-in
+    Jails  []JailStat  `json:"jails,omitempty"` // FreeBSD, opt-in
     Load   LoadStats   `json:"load"`
     Uptime uint64      `json:"uptime"`
 }
@@ -209,6 +234,9 @@ Sub-types (all explicit; no `map[string]interface{}` anywhere):
 | `FSStats[]`      | ~80 B each  | per-mount bytes + percent |
 | `TempStat[]`     | ~24 B each  | sensor name → °C |
 | `ProcStat[]`     | ~80 B each  | top-N processes by CPU |
+| `ZFSStats[]`     | ~64 B each  | per-pool size/alloc/free + health (opt-in) |
+| `ARCStats`       | ~40 B       | ARC size/target/max + lifetime hit rate (opt-in) |
+| `JailStat[]`     | ~72 B each  | jid, name, hostname, path, process count (opt-in) |
 | `LoadStats`      | ~24 B       | 1/5/15-minute load average |
 | `Uptime`         | 8 B         | seconds since boot |
 
@@ -270,6 +298,14 @@ dashboard.
 | `proc`    | `gopsutil/process.Processes` + `.Times` | none | top-N by CPU delta |
 | `load`    | `gopsutil/load.Avg` | none | wraps `getloadavg(3)` |
 | `uptime`  | `gopsutil/host.Uptime` | none | seconds since boot |
+| `zfs`     | `zpool list` (exec) | none | FreeBSD-only, opt-in; per-pool capacity |
+| `arc`     | `kstat.zfs.misc.arcstats.*` sysctl | none | FreeBSD-only, opt-in; ARC size + lifetime hit rate |
+| `jails`   | `jls` + `ps -axo jid=` (exec) | none | FreeBSD-only, opt-in; per-jail process count |
+
+The last three are FreeBSD-only and gated behind `[collect] zfs` / `jails`
+(default off), because each shells out every tick. Their exec/sysctl wrappers
+live in `//go:build freebsd` files with non-FreeBSD stubs; the output parsing
+sits in `bsdextra_parse.go` (no build tag) so it is unit-tested on any host.
 
 ### Delta-based collectors
 
@@ -285,8 +321,12 @@ Consequences:
 
 - **First sample is empty.** No previous to diff against. `Sampler.Run`
   primes once and sleeps one interval before publishing.
-- **Counter wrap-around** is not specially handled — FreeBSD uses
-  64-bit counters; throughput would have to exceed ~1.8 EB to wrap.
+- **Counter resets are clamped.** When an interface or device is destroyed
+  and recreated under the same name, its kernel counter restarts at zero and
+  `current - previous` on a uint64 would wrap to ~1.8 × 10¹⁹, poisoning
+  charts, stored roll-up envelopes, and alerts. `deltaU64` returns 0 for
+  that tick instead (per-process CPU has the equivalent `pct < 0` clamp).
+  Genuine 64-bit wrap-around (~1.8 EB of traffic) is not a practical concern.
 - **Stopped processes disappear** from `proc.prev` on the next tick;
   no per-process state survives a PID exit.
 
@@ -352,19 +392,60 @@ Default capacity is 3600 = one hour at 1 s. Each snapshot is ~2 KB in
 memory (Go structs, not JSON), so the buffer caps at ~7 MB and stays
 bounded forever regardless of uptime.
 
-No on-disk persistence by design. A daemon restart loses history —
-that's the price for keeping the storage layer at ~60 lines of code.
-Long-term retention is a future Prometheus exporter (§19), not a
-modification to this layer.
+The ring itself has no on-disk persistence — a restart loses its hour of
+1 s-resolution history, and that keeps the hot path at ~60 lines with zero I/O.
+
+### Optional SQLite history — `store.SQLite`
+
+For retention beyond the ring, `[store]` enables a **parallel** on-disk store
+(`store/sqlite.go`), using the pure-Go `modernc.org/sqlite` driver so the
+static-binary / `CGO_ENABLED=0` guarantee (G1) holds. It:
+
+- receives every snapshot via a non-blocking `Push` (buffered channel, drops
+  on overflow — the ring is authoritative for the live view), so it never
+  stalls the sampler;
+- **rolls up** each `resolution` window (default 1 m) into a single row via an
+  in-memory accumulator (`rollup.go`): rather than keeping one arbitrary
+  sample and discarding the rest, it stores the window's element-wise
+  **average, minimum, and maximum** as three JSON `Snapshot`s (columns `data`,
+  `dmin`, `dmax`), keyed by the truncated bucket timestamp. Averaging alone
+  would erase the short spikes that make history useful; the min/max envelope
+  preserves them (surfaced by `/api/series?band=1`, §7). Set-valued fields that
+  can't be averaged — processes, jails, ARC — are carried from the last sample
+  in the bucket. The still-filling current bucket is flushed on rollover or
+  `Close`; the ring covers that recent window meanwhile;
+- **prunes** rows older than `retention` (default 30 d) hourly;
+- **coarsens** rows older than `coarse_after` (default 7 d) into one row per
+  `coarse_resolution` (default 1 h): the writer's maintenance pass (at startup
+  and hourly) merges each aged bucket group in place — exact min/max, mean of
+  bucket means for the average — batch-limited and cursor-driven so an upgrade
+  backlog drains without loading the whole tail into memory (D19). Buckets
+  already down to a single row are skipped, so steady state does no work;
+- **persists alert events** in a second table (`alert_events`, raw `Event`
+  JSON) written synchronously by the engine's sink — events are rare — and
+  pruned on the same `retention` schedule; `/api/alerts` reads it newest-first;
+- serves `Since(t)` (averages) and `RollupSince(t)` (average + envelope) for the
+  API's long-range merge (§7).
+
+A single background goroutine owns all sample writes and maintenance;
+`SetMaxOpenConns(1)` serialises those against reads from HTTP handlers and the
+rare alert-event insert, sidestepping SQLite lock contention at this
+~1-write/minute rate. Rows store whole `Snapshot`s as JSON, so the schema
+never needs migrating when the struct grows; the two envelope columns were
+added with a guarded `ALTER TABLE` that tolerates upgrading an older
+two-column database in place. Prometheus (`/metrics`) remains the answer for
+real long-term, queryable retention; SQLite just widens the dashboard's own
+window.
 
 ### Why a custom ring instead of a library?
 
 - Off-the-shelf ring buffers are either generic (interface{}/generics
   fighting Go's type system) or lock-per-element (unnecessary overhead).
 - A 60-line bespoke struct is auditable in one sitting.
-- The API package reads `[]Snapshot` directly from `Since()` without
-  copying, because RWMutex's `RLock` allows concurrent readers and
-  `Since()` returns a fresh slice.
+- The API package consumes the `[]Snapshot` that `Since()` returns
+  directly: the slice is built fresh per call and never aliases the
+  ring's backing array, and `RLock` lets multiple readers run
+  concurrently.
 
 ---
 
@@ -380,9 +461,17 @@ single `*http.ServeMux` — no router library, no middleware framework.
 | `GET`  | `/`                            | Serves embedded `index.html` and static assets |
 | `GET`  | `/api/host`                    | Hostname, OS, platform version, kernel, process count |
 | `GET`  | `/api/metrics`                 | Latest `Snapshot` (returns 503 if no data yet) |
-| `GET`  | `/api/series?metric=…&range=…` | Historical time series, uPlot-shaped |
+| `GET`  | `/api/series?metric=…&range=…` | Historical time series, uPlot-shaped (`cpu\|mem\|load\|net\|disk\|temp\|fs\|proc\|zfs\|arc\|jail`) |
+| `GET`  | `/api/alerts`                  | Alert rule states (ok/pending/firing, incl. the watchdog) + recent events (`?limit=`) |
 | `GET`  | `/api/stream`                  | Server-Sent Events: one `Snapshot` per sample |
+| `GET`  | `/api/ws`                      | WebSocket: same stream, one raw-JSON frame per sample |
+| `GET`  | `/metrics`                     | Prometheus text exposition of the latest `Snapshot` |
 | `GET`  | `/healthz`                     | Liveness probe — returns `ok` |
+
+`/api/series` transparently spans the in-memory ring and, when `[store]` is
+configured, the SQLite history: recent points come from the ring at full
+resolution, older points from the (downsampled) store, merged by timestamp
+(the ring wins on overlap). See §6.
 
 ### `/api/metrics` — current snapshot
 
@@ -430,20 +519,45 @@ Query parameters:
 
 | Parameter | Values | Default |
 |-----------|--------|---------|
-| `metric`  | `cpu` \| `mem` \| `load` \| `net` \| `disk` \| `temp` | `cpu` |
+| `metric`  | `cpu` \| `mem` \| `load` \| `net` \| `disk` \| `temp` \| `fs` \| `proc` \| `zfs` \| `arc` \| `jail` | `cpu` |
 | `range`   | Go duration (`15m`, `1h`) or integer seconds | `15m` |
 | `iface`   | NIC name (when `metric=net`) | sum all |
 | `dev`     | device name (when `metric=disk`) | sum all |
+| `mount`   | mount point (when `metric=fs`) | all mounts |
+| `pid`     | process id (when `metric=proc`) | current top-N |
+| `pool`    | pool name (when `metric=zfs`) | all pools |
+| `jid`     | jail id (when `metric=jail`) | current jails |
+| `band`    | `1`/`true` → append `<label>_min`/`_max` envelope columns | off |
 
 Notes:
 
+- Each metric's columns are built by one `seriesColumns` helper over a
+  `[]Snapshot`; the handler prepends the shared `ts` column. `band=1` calls it
+  three times — over the average, min, and max series from `snapsBanded` — and
+  interleaves the envelope columns, so it reuses the exact per-metric logic
+  rather than duplicating it (D18, §6).
 - For `metric=net|disk` without a filter, the handler **sums all
   interfaces/devices** per timestamp. With a filter, only that one is
   returned.
 - `metric=temp` returns one series per sensor name that appeared in
-  any snapshot within the range.
+  any snapshot within the range; `zfs` one used-% series per pool.
+- `metric=proc` builds one CPU-% series per PID in the latest snapshot's
+  top-N; `jail` one process-count series per jail in the latest snapshot.
+- `metric=arc` returns fixed `size`/`target` (bytes) and `hit_rate` (%)
+  columns — consumers pick columns or chart on separate axes.
 - Ranges longer than the ring's contents return only what's available.
 - Unknown metrics → 400.
+
+### `/api/alerts` — rule states + recent events
+
+Serves the alert engine's live view (via the `AlertSource` interface the
+daemon wires with `SetAlerts`): every rule's `ok`/`pending`/`firing` state
+with its last evaluated value, the `stale_after` watchdog as a synthetic
+`watchdog` rule, and recent events (`?limit=`, default 50, cap 500). Events
+come from the store's `alert_events` table when persistence is on — they
+survive restarts — else from the engine's capped in-memory history.
+`enabled: false` with empty arrays when no alerts are configured. The
+dashboard's Alerts card polls this every 10 s.
 
 ### `parseDuration` quirk
 
@@ -467,7 +581,14 @@ still works. This makes the API friendlier from `curl` and shell loops.
 | Required for BeastieMon | ✅ (one-way push) | overkill |
 
 The dashboard only ever consumes; nothing flows browser→server. SSE is
-the natural fit.
+the natural fit, and remains the dashboard default.
+
+A WebSocket endpoint (`/api/ws`, `gorilla/websocket`) is also offered for
+clients that prefer it. Both share the same `Broker`: since it now carries
+**raw JSON** (framing moved into each transport), the SSE handler prepends
+`data: …\n\n` while the WS handler writes the JSON as a single text frame.
+The broker doesn't know or care which transport a subscriber is — exactly the
+extensibility §19 predicted.
 
 ### Broker
 
@@ -475,11 +596,16 @@ the natural fit.
 type Broker struct {
     mu      sync.Mutex
     clients map[chan []byte]struct{}
+    done    chan struct{} // closed by Server.Close on shutdown
 }
 ```
 
 `Subscribe()` creates a buffered channel (capacity 8); `Publish(data)`
-fans out **non-blockingly**:
+fans out **non-blockingly**. The `done` channel exists for shutdown: SSE/WS
+connections are never idle, so without it `http.Server.Shutdown` would sit
+out its whole deadline waiting for them — `Server.Close` closes `done`, every
+streaming handler's `select` returns, and `Shutdown` completes in
+milliseconds (§12):
 
 ```go
 for ch := range b.clients {
@@ -538,7 +664,7 @@ No `event:` or `id:` fields — the dashboard treats every event as
 
 ### Stack
 
-- **Vanilla JavaScript**, ~400 lines, no framework.
+- **Vanilla JavaScript**, ~600 lines, no framework.
 - **uPlot** for charts (~50 KB minified). The fastest open-source
   time-series chart library; renders 100k points in <50 ms.
 - **CSS Grid** for the dashboard layout. Four-column wide, two-column
@@ -551,15 +677,21 @@ No `event:` or `id:` fields — the dashboard treats every event as
 1. `fetch('/api/host')` → fills the header strip (hostname, OS, kernel).
 2. `fetch('/api/series?metric=…&range=15m')` for each card → seeds
    historical chart data.
-3. Open `EventSource('/api/stream')` → on each snapshot:
+3. `fetch('/api/alerts')` → renders the Alerts card (rule states + recent
+   events); re-polled every 10 s — rule state changes on the daemon's
+   schedule, not the snapshot stream, so a slow poll is enough. The card
+   stays hidden until alerts are configured.
+4. Open `EventSource('/api/stream')` → on each snapshot:
    - Append to each chart's data array.
    - Trim points older than the selected range.
    - Call `chart.setData()` (uPlot's incremental update path).
    - Re-render temperature gauges, filesystem bars, top-procs table.
-4. Range selector (5 m / 15 m / 1 h / 6 h / 24 h) refetches series for
+5. Range selector (5 m / 15 m / 1 h / 6 h / 24 h) refetches series for
    the new window.
-5. Per-iface / per-device tab buttons are built lazily on the first SSE
-   event (we don't know iface names until then).
+6. Per-iface / per-device tab buttons are rebuilt lazily on the first SSE
+   event after load or a range change (we don't know iface names until
+   then); their click handlers are delegated to the tab strips and bound
+   once at init, so rebuilds never stack duplicate listeners.
 
 ### Embedded vs. CDN assets
 
@@ -577,15 +709,28 @@ After `vendor-js`, the binary embeds everything and runs offline.
 
 ## 10. CLI (`beastie`)
 
-### Key design choice: standalone
+### Key design choice: standalone by default, remote on request
 
-`beastie` does **not** talk to the HTTP API. It imports
+By default `beastie` does **not** talk to the HTTP API. It imports
 `internal/collect` and `internal/config` directly, creates a sampler,
 takes one sample, and prints it. This means:
 
 - Works when `beastied` isn't running.
 - Works when the dashboard port is blocked.
 - Shows exactly the same numbers as the dashboard (same code path).
+
+The cost of standalone sampling is one full `interval` of warm-up per
+invocation (delta collectors need two readings), bounded by
+`collectTimeout` = max(5 s, 2 × interval + 2 s); a timed-out collection warns
+on stderr rather than printing zeros as if real.
+
+`--remote` flips every command (incl. `top` and `check`) to `GET
+/api/metrics` on a running daemon instead (D20): `auto` resolves the target
+from the config's `server.listen`, otherwise it accepts `host:port`, a full
+URL, or an absolute path dialled as beastied's Unix socket. Credentials reuse
+the config's `[auth]` — bearer token first, else basic. Remote answers in
+milliseconds (the daemon's deltas are warm) and sees the daemon's exact view,
+including FreeBSD extras when enabled there.
 
 ### Command dispatch
 
@@ -605,19 +750,50 @@ beastie version
 beastie help
 ```
 
-Flag: `-config <path>` for non-default config file.
+Flags (must precede the command): `-config <path>` for a non-default
+config file, `--json` for machine-readable output, `--no-color` to force
+plain text, `--remote <addr>` to read from a running daemon.
+
+### JSON output (`--json`)
+
+`--json` short-circuits the text path: no banner, no host line, no ANSI —
+just JSON on stdout. Each subcommand marshals its slice of the
+`Snapshot` (`snap.CPU`, `snap.Mem`, …) using the same struct tags the
+daemon serves, so `beastie --json cpu` and `/api/metrics`'s `cpu` object
+are byte-identical. `status` (the default) emits the whole `Snapshot`.
+`top --json` emits **NDJSON** — one compact snapshot object per interval —
+which pipes cleanly into `jq` or a log shipper. The `collect.Snapshot`
+contract (§4) is what makes this a few lines of `switch`, not a parallel
+formatter.
 
 ### Continuous mode (`top`)
 
 The `top` subcommand runs the same one-shot snapshot in a loop,
-clearing the screen between renders. Refresh period = configured
-sample interval. `Ctrl-C` stops it.
+clearing the screen between renders, sleeping one interval between
+frames. With local sampling each frame also pays the delta warm-up, so
+the effective cadence is ~2× the interval; with `--remote` the fetch is
+instant and frames land every interval. `Ctrl-C` stops it.
 
-### Banner
+### Banner & colour guard
 
-Each invocation prints the Beastie mascot in ANSI red over a
-`BeastieMon v<version>` line. Suppressed when stdout is not a TTY
-(e.g. piped to `less`).
+Each interactive invocation prints the Beastie mascot in ANSI red over a
+`BeastieMon v<version>` line. Colour and the banner are emitted **only** when
+stdout is a terminal (`os.Stdout.Stat()` char-device check) and neither
+`NO_COLOR` nor `--no-color` is set; otherwise `applyColor(false)` blanks the
+escape vars and the banner is suppressed, so pipes/`less`/files get clean
+text. The colour constants are therefore `var`s, and the banner is built at
+print time from them (see D-note in `cmd/beastie`).
+
+### Check mode
+
+`beastie check [--warn N] [--crit N] <metric>` turns one metric into a
+nagios/Icinga plugin: it prints a single `STATUS: label = value | perfdata`
+line and exits `0/1/2/3`. `checkValue` maps the metric to a scalar (cpu total,
+mem/swap %, load1, worst fs %, hottest sensor, total net/disk bytes-per-sec)
+and `evalCheck` applies the thresholds (higher is worse; a threshold ≤ 0 is
+"unset"). Both are pure and unit-tested; output is always plain text
+regardless of TTY. A failed collection — local timeout or unreachable
+`--remote` daemon — exits `UNKNOWN` (3) instead of a false `OK … = 0.00`.
 
 ---
 
@@ -635,6 +811,27 @@ ring_size   = 3600                  # int, snapshots
 fs_include  = ["/", "/var"]         # []string, mount paths; empty = all
 net_exclude = ["lo0"]               # []string, NIC names
 top_procs   = 5                     # int, top-N for proc panel
+zfs         = false                 # bool, opt-in ZFS pool+ARC (FreeBSD, execs)
+jails       = false                 # bool, opt-in jail panel (FreeBSD, execs)
+
+[auth]                              # optional; disabled when all empty
+username    = ""                    # string; with password → HTTP Basic
+password    = ""                    # string
+token       = ""                    # string; → Bearer token / ?token=
+
+[store]                             # optional; disabled when path empty
+path        = ""                    # string; SQLite history file
+retention   = "720h"                # Duration; prune older (default 30d)
+resolution  = "1m"                  # Duration; roll-up window (default 1m)
+coarse_after      = "168h"          # Duration; re-aggregate older rows (default 7d; "0s" = off)
+coarse_resolution = "1h"            # Duration; coarse bucket width (default 1h)
+
+[alerts]                            # optional; disabled with no rules and no stale_after
+webhook     = ""                    # string; default webhook for rules (and the watchdog)
+format      = ""                    # string; default payload: raw|slack|discord
+stale_after = "0s"                  # Duration; sampler watchdog window (default off)
+# [[alerts.rule]] name, metric, field, op, threshold, for,
+#                 repeat, hysteresis, webhook, format
 ```
 
 ### Loader
@@ -647,6 +844,9 @@ func Load(path string) (Config, error) {
         return cfg, nil          // missing file = defaults
     }
     _, err := toml.DecodeFile(path, &cfg)
+    if err == nil {
+        cfg.normalize()          // clamp nonsensical values to defaults
+    }
     return cfg, err
 }
 ```
@@ -656,19 +856,34 @@ Properties:
 - Missing config file is non-fatal — defaults work everywhere.
 - Partial files are merged onto defaults — you only need to specify
   what you want to change.
-- The `duration` shim implements `encoding.TextUnmarshaler` so the
-  TOML can use natural strings like `"500ms"`.
+- Nonsensical values are clamped back to defaults rather than crashing the
+  daemon: `interval = "0s"` would panic `time.NewTicker`, `ring_size = 0`
+  would panic the ring's first `Push`. `normalize` covers interval,
+  ring_size, top_procs, retention, and resolution. (`coarse_after = "0s"` is
+  *not* clamped — zero legitimately means "coarse tier off".)
+- The `Duration` shim (exported so external packages/tests can build rule
+  values) implements `encoding.TextUnmarshaler` so the TOML can use natural
+  strings like `"500ms"`.
 
 ### Defaults
 
-| Field         | Default                            |
-|---------------|------------------------------------|
-| `listen`      | `127.0.0.1:8088`                   |
-| `interval`    | `1s`                               |
-| `ring_size`   | `3600`                             |
-| `fs_include`  | `["/", "/var", "/usr", "/tmp"]`    |
-| `net_exclude` | `["lo0"]`                          |
-| `top_procs`   | `5`                                |
+| Field             | Default                            |
+|-------------------|------------------------------------|
+| `listen`          | `127.0.0.1:8088`                   |
+| `interval`        | `1s`                               |
+| `ring_size`       | `3600`                             |
+| `fs_include`      | `["/", "/var", "/usr", "/tmp"]`    |
+| `net_exclude`     | `["lo0"]`                          |
+| `top_procs`       | `5`                                |
+| `zfs` / `jails`   | `false` (opt-in FreeBSD panels)    |
+| `auth.*`          | empty (authentication disabled)    |
+| `store.path`      | empty (persistence disabled)       |
+| `store.retention` | `720h` (30 days)                   |
+| `store.resolution`| `1m`                               |
+| `store.coarse_after` | `168h` (7 days; `0s` disables the coarse tier) |
+| `store.coarse_resolution` | `1h`                      |
+| `alerts.rule[]`   | none                               |
+| `alerts.stale_after` | `0s` (watchdog disabled)        |
 
 ---
 
@@ -676,15 +891,27 @@ Properties:
 
 ### Goroutines
 
-The daemon has exactly **four** kinds of goroutines:
+The daemon has these kinds of goroutines:
 
-1. **Main goroutine** — runs `for snap := range sampler.C { server.Ingest(snap) }`.
+1. **Main goroutine** — `select` over sampler channel / SIGHUP / a 1 s
+   watchdog tick / shutdown; `server.Ingest(snap)` then `alerts.Eval(snap)`
+   per tick, `alerts.CheckStale(now)` per watchdog tick (the watchdog can't
+   ride on snapshots — a wedged sampler stops producing them).
 2. **Sampler goroutine** — runs `sampler.Run(ctx)`, ticks every interval.
-3. **HTTP server goroutine** — `net/http`'s accept loop, started in main.
-4. **One per HTTP connection** — `net/http` spawns these; the SSE handler
-   blocks on `select { ctx.Done() / msg := <-ch }`.
+   Under a child context so a SIGHUP reload can cancel and replace it.
+3. **HTTP server goroutine** — `http.Server.Serve(ln)`'s accept loop.
+4. **One per HTTP connection** — `net/http` spawns these; the SSE/WS handlers
+   block on `select { ctx.Done() / broker.done / msg := <-ch }` (the WS
+   handler also has a short-lived reader goroutine to drain control frames /
+   detect close).
+5. **SQLite writer goroutine** (only when `[store]` is set) — drains the
+   store's buffered channel, persists downsampled rows, and runs maintenance
+   (retention prune + coarse-tier re-aggregation) at startup and hourly.
+6. **Webhook POSTs** (only with `[alerts]`) — each fired event POSTs on its
+   own short-lived goroutine so a slow endpoint never stalls `Eval`.
 
-There are no worker pools, no work queues, no fan-in beyond the ring's RWMutex.
+There are no worker pools or work queues; fan-in is the ring's RWMutex and the
+broker's mutex.
 
 ### Synchronisation primitives
 
@@ -692,27 +919,56 @@ There are no worker pools, no work queues, no fan-in beyond the ring's RWMutex.
 |-------------------------|--------------|------------|
 | `store.Ring.buf`        | `sync.RWMutex` | Push takes write; Last/Since take read |
 | `api.Broker.clients`    | `sync.Mutex` | held briefly for fan-out + map mutation |
+| `api.Server.auth`/`.alerts` | `sync.RWMutex` | handlers read; SIGHUP reload swaps (SetAuth/SetAlerts) |
+| `alert.Engine` state    | `sync.Mutex` | Eval/CheckStale mutate on the main loop; States/Events read from HTTP handlers |
 | Sampler→main delivery   | `chan Snapshot` cap 4 | non-blocking send; drop on overflow |
-| Broker→SSE delivery     | `chan []byte` cap 8 per client | non-blocking send; drop on overflow |
+| Broker→SSE/WS delivery  | `chan []byte` cap 8 per client | raw JSON; non-blocking send; drop on overflow |
+| Broker shutdown         | `done chan struct{}` | closed once by `Server.Close`; unblocks streaming handlers |
+| main→SQLite writer      | `chan Snapshot` cap 64 | non-blocking Push; drop on overflow (ring is authoritative) |
+| `SQLite.agg`            | `sync.Mutex` | guards the accumulating bucket (ingest/flush) |
+| SQLite DB handle        | `SetMaxOpenConns(1)` | one connection serialises writer, HTTP reads, and alert-event inserts |
 
-### Shutdown
+### Shutdown & reload
 
 ```go
-ctx, cancel := signal.NotifyContext(ctx, SIGINT, SIGTERM)
-defer cancel()
-go sampler.Run(ctx)        // ctx.Done() stops the ticker
-go http.ListenAndServe(…)  // not stopped — daemon process exits
+rootCtx, stop := signal.NotifyContext(ctx, SIGINT, SIGTERM)
+sampCtx, sampCancel := context.WithCancel(rootCtx)
+go sampler.Run(sampCtx)
+httpSrv := &http.Server{Handler: srv}; go httpSrv.Serve(ln)
+signal.Notify(hup, SIGHUP)
 for {
     select {
-    case <-ctx.Done(): return
-    case snap := <-sampler.C: server.Ingest(snap)
+    case <-rootCtx.Done():           // SIGINT/SIGTERM
+        sampCancel()
+        srv.Close()                  // closes broker.done → SSE/WS handlers return
+        httpSrv.Shutdown(ctx5s)      // graceful; returns promptly (streams already gone)
+        return                       // deferred store.Close() flushes + closes DB
+    case <-hup:                      // SIGHUP: hot reload
+        newCfg := config.Load(path)
+        srv.SetAuth(newCfg.Auth); buildAlerts(newCfg.Alerts) // engine + sink + SetAlerts
+        sampCancel(); sampler = collect.NewSampler(newCfg); go sampler.Run(newSampCtx)
+    case now := <-staleTick.C:       // 1 s wall-clock tick
+        alerts.CheckStale(now)       // sampler watchdog (no-op unless stale_after set)
+    case snap := <-sampler.C:
+        srv.Ingest(snap); alerts.Eval(snap)
     }
 }
 ```
 
-The HTTP server isn't gracefully shut down because the process exits
-anyway and there are no in-flight writes to flush. If we add SQLite
-roll-ups, that calculus changes.
+**Graceful shutdown** (now that a store can hold open a DB handle):
+`srv.Close()` first unblocks the never-idle SSE/WS handlers (via the broker's
+`done` channel — without this, `Shutdown` would always sit out its full 5 s
+deadline with a dashboard open), then `http.Server.Shutdown` drains the rest,
+then the deferred `store.Close()` stops the writer (flushing the open bucket)
+and closes SQLite. **SIGHUP reload** re-reads the config and applies the
+hot-reloadable parts in place — auth, the alert engine (rules, `stale_after`,
+re-wired to the API and the event sink via `buildAlerts`; note the rebuilt
+engine starts with fresh firing state), and the sampler (interval,
+`fs_include`, `net_exclude`, `top_procs`, `zfs`, `jails`) by cancelling and
+re-launching it under a fresh child context. `listen`, `ring_size`, and the
+store path require a restart (the daemon logs a warning if they changed). The
+`select` re-reads `sampler.C` each iteration, so swapping the `sampler`
+variable is race-free.
 
 ### What can go wrong
 
@@ -764,28 +1020,38 @@ and pass `-u ${beastied_runas}` to `daemon(8)` instead. `daemon(8)`
 writes the PID file as root, then drops privileges before exec'ing
 `beastied`.
 
+#### 3. Two pidfiles: supervisor (`-P`) and child (`-p`)
+
+`daemon(8)` writes the supervisor PID to `-P /var/run/beastied.pid` (used by
+`service status`/`stop`, per detail #1) **and** the child PID to
+`-p /var/run/beastied_child.pid`. The `reload_cmd` sends `SIGHUP` to the child
+PID so `service beastied reload` reaches `beastied` itself (config reload),
+not the supervisor. `newsyslog` still signals the *supervisor* pidfile, which
+makes `daemon(8)` reopen its `-o` log after a rotate — the two signals have
+distinct targets and don't collide.
+
+#### 4. Unix-domain socket listener
+
+`listen` starting with `/` binds a Unix socket instead of TCP (main's
+`listen()` helper removes any stale socket, `net.Listen("unix", …)`, then
+`chmod 0660`). Useful for local-only access — e.g. an nginx `proxy_pass` to
+the socket — with no TCP port exposed.
+
 ### Sample → publish loop
 
 ```
 main:
-    cfg     = config.Load(path)
+    cfg     = config.Load(path)               // normalize() clamps bad values
     ring    = store.NewRing(cfg.Collect.RingSize)
-    srv     = api.New(ring, webFS)
-    sampler = collect.NewSampler(cfg)
-
-    go func() {
-        http.ListenAndServe(cfg.Server.Listen, srv)
-    }()
-
-    go sampler.Run(ctx)        // ticks, collects, sends to sampler.C
-
-    for {
-        select {
-        case <-ctx.Done(): return
-        case snap := <-sampler.C:
-            srv.Ingest(snap)   // ring.Push + broker.Publish
-        }
-    }
+    srv     = api.New(ring, webFS, cfg.Auth)
+    if cfg.Store.Enabled():  srv.SetStore(store.OpenSQLite(path, store.Options{…}))
+    buildAlerts(cfg.Alerts)                    // engine + event sink → store, srv.SetAlerts
+    ln = listen(cfg.Server.Listen)            // TCP or Unix socket
+    go http.Server{Handler: srv}.Serve(ln)
+    go sampler.Run(sampCtx)                    // ticks → sampler.C
+    // main select loop: sampler.C → Ingest + alerts.Eval; 1 s tick →
+    // alerts.CheckStale; SIGHUP → reload; ctx.Done → srv.Close +
+    // graceful Shutdown. See §12 for the full loop.
 ```
 
 The buffered channel between sampler and main absorbs short JSON-encode
@@ -809,6 +1075,7 @@ files: {
   /usr/local/bin/beastie:  "-",
   /usr/local/etc/rc.d/beastied: "-",
   /usr/local/etc/beastiemon.conf.sample: "-",
+  /usr/local/etc/newsyslog.conf.d/beastied.conf: "-",
 }
 scripts: {
   pre-install:  …   # pw groupadd/useradd, add to operator group
@@ -825,12 +1092,12 @@ because the path doesn't exist in the stage tree.
 ### Makefile pipeline
 
 ```
-$ gmake VERSION=0.1.0 pkg
+$ gmake VERSION=0.2.0 pkg
    ├── deps          (go mod download / tidy)
    ├── vendor-js     (download uPlot, rewrite index.html, patch assets.go)
    ├── build         (GOOS=freebsd GOARCH=amd64; produces beastied, beastie)
    ├── stage         (lay out .stage/ with bins, rc.d, conf.sample)
-   └── pkg           (pkg create --format txz → .pkg/beastiemon-0.1.0.pkg)
+   └── pkg           (pkg create --format txz → .pkg/beastiemon-0.2.0.pkg)
 ```
 
 ### Install paths
@@ -842,6 +1109,7 @@ $ gmake VERSION=0.1.0 pkg
 | `freebsd/beastied.in`              | `/usr/local/etc/rc.d/beastied`                 |
 | `freebsd/beastiemon.conf`          | `/usr/local/etc/beastiemon.conf.sample`        |
 | (post-install hook copies sample)  | `/usr/local/etc/beastiemon.conf` (only if absent) |
+| `freebsd/newsyslog.conf`           | `/usr/local/etc/newsyslog.conf.d/beastied.conf` |
 
 ### System user
 
@@ -866,16 +1134,66 @@ that owns files on disk is dangerous. The hint is printed instead.
 
 | Property                     | Stance                                  |
 |------------------------------|-----------------------------------------|
-| Authentication               | None — by design (G2). Use a proxy.     |
+| Authentication               | Optional built-in (`[auth]`), off by default. |
 | Transport encryption         | None — by design. Use a proxy.          |
 | Default bind                 | `127.0.0.1:8088`                        |
 | Privileges                   | `_beastie` (uid/gid 874), nologin shell |
 | Elevated capabilities        | `operator` group for `devstat(3)` only  |
-| Disk writes                  | `/var/log/beastied.log` only            |
+| Disk writes                  | `/var/log/beastied.log`; `[store]` SQLite file if configured |
 | Config readability           | `0640` root:_beastie                    |
 | Log file                     | `0640` root:_beastie                    |
 | PID file                     | `0644` root:wheel                       |
-| Outbound network             | None                                    |
+| Outbound network             | None, **unless `[alerts]` is set** — then webhook POSTs to the configured URL(s) |
+
+`/metrics` and `/api/ws` sit behind the same `[auth]` gate as every other
+endpoint except `/healthz`. Enabling `[store]` adds one writable path (the
+SQLite file, which must be owned by `_beastie`); enabling `[alerts]` is the
+only thing that makes `beastied` originate outbound connections, and only to
+the operator-supplied webhook URLs.
+
+### Optional authentication (`[auth]`)
+
+Implemented as a single gate in `Server.ServeHTTP`, ahead of the mux (the
+auth config is copied out under the server's RWMutex first, because SIGHUP
+reload can swap it concurrently):
+
+```go
+s.mu.RLock()
+auth := s.auth
+s.mu.RUnlock()
+if auth.Enabled() && r.URL.Path != "/healthz" && !authorized(r, auth) {
+    if auth.BasicEnabled() {
+        w.Header().Set("WWW-Authenticate", `Basic realm="BeastieMon"`)
+    }
+    http.Error(w, "unauthorized", http.StatusUnauthorized)
+    return
+}
+```
+
+Properties:
+
+- **Off by default.** `AuthConfig.Enabled()` is false when all three
+  fields are empty, so the gate is a no-op and behaviour is unchanged.
+- **Two mechanisms, either suffices.** HTTP Basic (username+password)
+  and a bearer token coexist; `authorized()` returns true if *any*
+  configured credential matches. Basic makes browsers prompt natively
+  (the `WWW-Authenticate` header is only sent when Basic is enabled, so
+  token-only deployments don't trigger a useless browser prompt).
+- **Constant-time comparison.** Both checks use
+  `crypto/subtle.ConstantTimeCompare` so a matching prefix can't be
+  recovered from response timing.
+- **`?token=` escape hatch.** `EventSource` can't set headers, so the
+  token is also accepted as a query parameter — at the documented cost
+  of the token appearing in proxy/access logs.
+- **`/healthz` is exempt** so liveness probes keep working unauthenticated.
+- **Still no TLS.** Credentials cross the wire in clear text; built-in
+  auth is access control for a trusted network, not a proxy replacement.
+
+The gate is covered by table-driven tests in
+`internal/api/server_test.go`: auth-disabled pass-through, Basic auth
+(missing → 401 + challenge, wrong password → 401, correct → 200), bearer
+token via header and `?token=`, the token-only path *not* emitting a
+Basic challenge, and `/healthz` staying open.
 
 ### Threat model
 
@@ -965,8 +1283,10 @@ everything else keeps working.
 
 The daemon **does** call `log.Fatalf` for:
 
-- Config parse error during startup.
-- HTTP `ListenAndServe` failure (port in use, address invalid).
+- Config parse error during startup (merely *nonsensical* values — a zero
+  interval or ring size — are clamped to defaults instead, §11).
+- Failure to open the SQLite history file when `[store]` is enabled.
+- HTTP listen failure (port in use, address invalid).
 
 The reasoning: these are operator misconfigurations, not transient
 failures. Crashing fast surfaces them in `rc.d`'s output; `daemon(8) -r`
@@ -991,16 +1311,19 @@ is portable.
 
 ### What's FreeBSD-only
 
-- `internal/collect/temp.go` (gated by `//go:build freebsd`).
-  - Stubbed by `temp_other.go` on other OSes.
-- `freebsd/*` packaging (rc.d, manifest, conf path).
+- `internal/collect/temp.go`, `zfs.go`, `jail.go` (all `//go:build freebsd`),
+  each stubbed by a `*_other.go` file on other OSes. Their pure parsers live
+  in `bsdextra_parse.go` (no build tag) and are unit-tested everywhere.
+- `freebsd/*` packaging (rc.d, manifest, conf path, newsyslog).
 - `Makefile` uses BSD `sed -i ''` syntax in `vendor-js`.
 
 ### What's portable
 
 - All other collectors use `gopsutil`, which supports Linux, macOS,
   Windows, FreeBSD.
-- HTTP, SSE, embed, JSON: standard library.
+- HTTP, SSE, WebSocket, embed, JSON: standard library + `gorilla/websocket`.
+- SQLite history uses the **pure-Go** `modernc.org/sqlite`, so persistence is
+  portable *and* CGO-free.
 - Frontend: pure browser.
 
 ### Linux dev workflow
@@ -1010,29 +1333,57 @@ gmake build-native
 ./beastied -config freebsd/beastiemon.conf
 ```
 
-CPU, memory, disk, network, filesystem, processes work. Temperatures
-are empty (the stub returns `nil`). Useful for iterating on the
-dashboard without booting a FreeBSD VM.
+CPU, memory, disk, network, filesystem, processes, persistence, alerts, and
+the HTTP/WS/Prometheus surfaces all work on Linux. Temperatures, ZFS, and
+jails are empty (their stubs return `nil`). Useful for iterating on the
+dashboard and API without booting a FreeBSD VM.
 
 ---
 
 ## 19. Future Extensions
 
-The architecture makes these additive (no restructuring required):
+The architecture was built to make these additive — and most have now
+shipped without restructuring, which is the evidence that the extension model
+(typed `Snapshot`, transport-agnostic broker, `internal/` seams) works.
 
-| Extension | Surface | Mechanism |
-|-----------|---------|-----------|
-| Prometheus exporter        | new endpoint `/metrics` | text exposition of latest `Snapshot` |
-| SQLite roll-ups (30-day)   | new `internal/store/sqlite.go` | parallel to ring; written async |
-| ZFS pool stats             | new collector | `libzfs` via cgo, new `ZFSStats` field |
-| Jail-aware metrics         | new collector | `jail_get(2)` enumeration |
-| Per-process history        | extend ring | already in `snap.Procs` — just plot it |
-| Alert rules                | `[alerts]` section | `expr > threshold for duration` → webhook |
-| Web auth (optional)        | middleware | shared-secret basic auth on all `/api/*` |
-| WebSocket (if ever needed) | parallel to SSE | broker doesn't care about transport |
+### Shipped
 
-The wire format and HTTP API don't need breaking changes for any of
-these — they're all additive at the data-model layer.
+| Extension | Where it landed |
+|-----------|-----------------|
+| Optional web auth (`[auth]`, Basic + bearer) | `Server.ServeHTTP` gate — §15 |
+| `--json` CLI mode | `cmd/beastie` — §10 |
+| CLI TTY / `NO_COLOR` guard + `check` mode | `cmd/beastie` — §10 |
+| Prometheus `/metrics` exporter | `api/prometheus.go` — §7 |
+| WebSocket transport | `/api/ws`, shared broker — §8 |
+| FS + proc history series | `/api/series` `fs`/`proc` — §7 |
+| SQLite history (downsample + prune) | `store/sqlite.go` — §6 |
+| ZFS pool + ARC, jail metrics | `collect/zfs.go`, `jail.go` — §5 |
+| Threshold alerts + webhook | `internal/alert` — §11 |
+| Graceful shutdown + SIGHUP reload | `cmd/beastied` — §12–13 |
+| Unix-socket listener | `cmd/beastied` `listen()` — §13 |
+| `newsyslog` log rotation | `freebsd/newsyslog.conf` — §14 |
+| Dashboard light/dark theme | `web/` — §9 |
+| Statistical roll-ups (avg + min/max band) | `store/rollup.go`, `/api/series?band=1` — §6, D18 |
+| Alert re-notify, hysteresis, Slack/Discord payloads | `internal/alert` — §11, D17 |
+| Alert state API + dashboard card + persisted events | `/api/alerts`, `Engine.States`/`Events`/`SetSink`, `store` `alert_events` table — §7, §11 |
+| Sampler watchdog (`stale_after`) | `Engine.CheckStale` on a 1 s daemon tick — §11 |
+| ZFS / ARC / jail history series | `/api/series` `zfs`/`arc`/`jail` — §7 |
+| Tiered downsampling (coarse tier) | `store/sqlite.go` `coarsen` — §6, D19 |
+| CLI remote mode (`--remote`, incl. Unix socket) | `cmd/beastie` `fetchRemote` — §10, D20 |
+| `check net`/`check disk` | `cmd/beastie` `checkValue` — §10 |
+
+### Still open
+
+| Extension | Mechanism |
+|-----------|-----------|
+| Alert expressions | compound/multi-metric conditions and templated PagerDuty-style payloads (threshold, re-notify, hysteresis, watchdog, and state/event visibility have shipped) |
+| Grafana dashboard | ship a `.json` built on the `/metrics` series |
+| Per-jail CPU/mem | needs `rctl`/`kinfo_proc` `ki_jid`; the current jail panel is enumeration + process count only |
+
+Deliberately **out of scope** (see §1 Non-Goals): in-daemon TLS (proxy's
+job), a full rule engine beyond threshold alerts, and any fleet/federation
+layer. The wire format and HTTP API haven't needed a breaking change for any
+of the shipped work — all of it was additive at the data-model layer.
 
 ---
 
@@ -1075,7 +1426,7 @@ A running record of decisions where the alternative isn't obvious.
 - **Decision:** Pure browser JS.
 - **Why:** The dashboard is small enough not to need React/Vue/Svelte;
   no Node toolchain on FreeBSD build hosts.
-- **Trade-off:** ~400 lines of imperative DOM manipulation. We accept
+- **Trade-off:** ~600 lines of imperative DOM manipulation. We accept
   this.
 
 ### D6 — Custom ring buffer, not container/list or third-party
@@ -1122,3 +1473,92 @@ A running record of decisions where the alternative isn't obvious.
 - **Why:** `pkg create` validates that every directory listed in the
   manifest exists in the stage tree. `/var/log` is base-system and
   shouldn't be owned by the package anyway.
+
+### D13 — Pure-Go SQLite (`modernc.org/sqlite`), not cgo
+
+- **Decision:** `modernc.org/sqlite` for `[store]`.
+- **Why:** Keeps `CGO_ENABLED=0`, the static single binary, and the
+  cross-compile-from-any-host story (G1) — a cgo driver (`mattn/go-sqlite3`)
+  would break all three.
+- **Trade-off:** Larger binary and a heavier dependency tree, and it raises
+  the minimum Go toolchain (pinned to a modernc release whose floor is Go
+  1.23). Worth it to hold the core invariant.
+
+### D14 — Broker carries raw JSON; transports frame it
+
+- **Decision:** `Ingest` publishes raw `Snapshot` JSON; SSE prepends
+  `data: …`, WS sends a text frame.
+- **Why:** Adding WebSocket (D#) shouldn't fork the fan-out. One payload, many
+  transports — the broker stays transport-agnostic (D11 already made it
+  content-agnostic).
+
+### D15 — ZFS/jail collectors shell out, gated + parser-split
+
+- **Decision:** `zpool`/`jls`/`ps` via `os/exec` (ARC via `kstat` sysctl),
+  behind `[collect] zfs`/`jails` (default off), parsing split into a
+  build-tag-free file.
+- **Why:** `libzfs`/`jail_get(2)` mean cgo or fragile syscall marshaling;
+  base-system tools are robust and keep CGO off. Gating avoids spawning
+  subprocesses every tick on hosts that don't use them. Splitting the parser
+  out lets it be unit-tested on Linux even though the collector is FreeBSD-only.
+
+### D16 — Alerts fire webhooks asynchronously
+
+- **Decision:** each fired event POSTs on its own goroutine; `post` is an
+  injected func so tests observe events without HTTP.
+- **Why:** a slow/hung webhook must never stall `Eval` (and thus the sampler).
+  Mirrors the non-blocking philosophy of D11.
+
+### D17 — Alert re-notify + hysteresis as per-rule state, formats at the edge
+
+- **Decision:** `repeat` (re-notify cadence while firing) and `hysteresis`
+  (recovery margin) live as extra fields on `ruleState`; the `Eval` state
+  machine gained a `firing` branch that re-emits on the `repeat` clock and only
+  resolves once `cleared()` (threshold ∓ hysteresis) is true. Payload shaping
+  (`raw`/`slack`/`discord`) happens in `renderPayload` at the HTTP edge, not in
+  the state machine — `post` carries the format alongside the `Event`.
+- **Why:** hysteresis and re-notify are the two smallest knobs that cover the
+  real operational failure modes (flapping at the boundary; a fired-once alert
+  going unnoticed) without a general rule-expression language (a Non-Goal, §1).
+  Keeping formatting a pure function of `(format, Event)` leaves the engine and
+  its tests format-agnostic and makes the chat shapes trivially unit-testable.
+
+### D18 — History roll-ups store avg + min/max, not one raw sample
+
+- **Decision:** each `resolution` bucket is aggregated in memory into three
+  snapshots (average, min, max) rather than keeping the first raw sample; the
+  envelope rides in two nullable JSON columns and surfaces via
+  `/api/series?band=1`.
+- **Why:** downsampling to one raw sample per minute silently drops the spikes
+  that motivate keeping history at all. The average gives a stable line; the
+  min/max band restores the peaks — at 3× the JSON per row, negligible against
+  the ~1-write/minute rate. Set-valued fields (procs/jails/ARC) aren't
+  meaningfully averageable, so they carry from the last sample.
+
+### D19 — Coarse tier merges rows in place, mean-of-means
+
+- **Decision:** rows older than `coarse_after` are re-aggregated in place
+  (delete N fine rows, insert one coarse row per `coarse_resolution` bucket)
+  by the store's own writer goroutine, batch-limited and cursor-driven so a
+  restart backlog drains without loading the whole tail into memory. The
+  merged average is the mean of bucket means; min/max merge exactly.
+- **Why:** no schema change, no second table, and readers (`Since`,
+  `RollupSince`) stay oblivious — a coarse row is just a snapshot row. The
+  mean-of-means skew is negligible because fine buckets hold near-equal
+  sample counts (fixed interval, fixed resolution). Single-row buckets are
+  skipped, so steady state does no work.
+- **Trade-off:** exact weighted averages would need a sample-count column;
+  not worth the migration for a monitoring trend line.
+
+### D20 — CLI remote mode reuses `/api/metrics` and the config's `[auth]`
+
+- **Decision:** `beastie --remote` fetches the daemon's latest snapshot over
+  the existing API (TCP or the Unix socket) instead of growing a private
+  RPC; credentials come from the same config file the daemon reads.
+- **Why:** local sampling pays a full interval of warm-up per invocation and
+  diverges from what the daemon sees (top-N ranking, FreeBSD extras);
+  remote mode is instant, consistent, and works over SSH tunnels. One wire
+  format (`Snapshot` JSON) keeps CLI and API output byte-identical.
+- **Trade-off:** remote `check` depends on the daemon being up — which is
+  itself signal: connection failure maps to nagios `UNKNOWN`, and the
+  `stale_after` watchdog covers the wedged-sampler case from inside.

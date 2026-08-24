@@ -47,10 +47,10 @@ func (n *NetCollector) Collect() []NetStats {
 			}
 			stats = append(stats, NetStats{
 				Interface: name,
-				RxBps:     round2(float64(c.BytesRecv-p.BytesRecv) / dt),
-				TxBps:     round2(float64(c.BytesSent-p.BytesSent) / dt),
-				RxPps:     round2(float64(c.PacketsRecv-p.PacketsRecv) / dt),
-				TxPps:     round2(float64(c.PacketsSent-p.PacketsSent) / dt),
+				RxBps:     round2(deltaU64(c.BytesRecv, p.BytesRecv) / dt),
+				TxBps:     round2(deltaU64(c.BytesSent, p.BytesSent) / dt),
+				RxPps:     round2(deltaU64(c.PacketsRecv, p.PacketsRecv) / dt),
+				TxPps:     round2(deltaU64(c.PacketsSent, p.PacketsSent) / dt),
 			})
 		}
 	}
