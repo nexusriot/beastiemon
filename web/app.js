@@ -28,27 +28,28 @@ const COLORS = {
   muted:  '#8b949e',
 };
 
+// Read a CSS custom property so chart axis colours follow the active theme.
+function cssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+// mkAxes builds x/y axis styling from the current theme's CSS variables.
+// Called at load and again on theme toggle (charts are rebuilt).
+function mkAxes() {
+  const stroke = cssVar('--muted', '#8b949e');
+  const grid = cssVar('--border', '#30363d');
+  const base = { stroke, grid: { stroke: grid, width: 1 }, ticks: { show: false }, font: '10px monospace' };
+  return [{ ...base }, { ...base, size: 52 }];
+}
+
 const baseOpts = {
   width:  100,
   height: 160,
   padding: [8, 0, 0, 0],
   cursor: { show: true, sync: { key: 'bm' } },
   select: { show: false },
-  axes: [
-    {
-      stroke: '#8b949e',
-      grid:   { stroke: '#21262d', width: 1 },
-      ticks:  { show: false },
-      font:   '10px monospace',
-    },
-    {
-      stroke: '#8b949e',
-      grid:   { stroke: '#21262d', width: 1 },
-      ticks:  { show: false },
-      font:   '10px monospace',
-      size:   52,
-    },
-  ],
+  axes: mkAxes(),
   legend: { show: true, live: true },
 };
 
@@ -89,7 +90,13 @@ function buildCPUChart(data) {
       { label: 'Sys',   stroke: COLORS.orange,  fill: 'rgba(210,153,34,0.15)', width: 1.5 },
       { label: 'Idle',  stroke: COLORS.muted,   fill: 'rgba(139,148,158,0.07)',width: 1 },
       { label: 'Total', stroke: COLORS.red,     width: 2, dash: [4,2] },
+      // Total min/max envelope from /api/series?band=1. Full-resolution (live)
+      // points have min=max=total so the band collapses onto the line; on wide
+      // ranges the rolled-up buckets spread it into a spike envelope.
+      { label: 'min', stroke: 'rgba(248,81,73,0.35)', width: 0.5, points: { show: false } },
+      { label: 'max', stroke: 'rgba(248,81,73,0.35)', width: 0.5, points: { show: false } },
     ],
+    bands: [{ series: [6, 5], fill: 'rgba(248,81,73,0.10)' }],
     axes: [
       baseOpts.axes[0],
       { ...baseOpts.axes[1], values: (u, vals) => vals.map(v => v != null ? v.toFixed(0)+'%' : '') },
@@ -199,7 +206,15 @@ async function fetchSeries(metric, extra = '') {
   return r.json();
 }
 
-async function loadCPU()  { const d = await fetchSeries('cpu');  buildCPUChart(d.data); }
+async function loadCPU() {
+  const d = await fetchSeries('cpu', '&band=1');
+  const col = {};
+  d.labels.forEach((l, i) => { col[l] = d.data[i]; });
+  const n = (col.ts || []).length;
+  const pick = k => col[k] || new Array(n).fill(null);
+  buildCPUChart([col.ts || [], pick('user'), pick('sys'), pick('idle'),
+    pick('total'), pick('total_min'), pick('total_max')]);
+}
 async function loadLoad() { const d = await fetchSeries('load'); buildLoadChart(d.data); }
 async function loadMem()  { const d = await fetchSeries('mem');  buildMemChart(d.data); }
 
@@ -256,7 +271,8 @@ function applyLiveSnap(snap) {
     el.style.color = cpuPct >= 90 ? COLORS.red : cpuPct >= 70 ? COLORS.orange : COLORS.green;
   }
   appendToChart(state.charts.cpu, ts,
-    [snap.cpu?.user, snap.cpu?.sys, snap.cpu?.idle, snap.cpu?.total]);
+    [snap.cpu?.user, snap.cpu?.sys, snap.cpu?.idle, snap.cpu?.total,
+     snap.cpu?.total, snap.cpu?.total]);
 
   // Load
   document.getElementById('load1').textContent  = snap.load?.load1?.toFixed(2)  ?? '—';
@@ -308,8 +324,53 @@ function applyLiveSnap(snap) {
   // Top processes
   renderProcs(snap.procs || []);
 
+  // ZFS pools / ARC and jails (FreeBSD-only; cards hide when absent).
+  renderZFS(snap.zfs || [], snap.arc);
+  renderJails(snap.jails || []);
+
   // Build iface / dev tabs if not yet built.
   buildIfaceTabs(snap.net || [], snap.disk || []);
+}
+
+function renderZFS(pools, arc) {
+  const card = document.getElementById('card-zfs');
+  if (!card) return;
+  if (!pools.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const arcEl = document.getElementById('arc-val');
+  if (arcEl) arcEl.textContent = arc
+    ? `ARC ${humanBytes(arc.size)} · ${arc.hit_rate.toFixed(0)}% hit`
+    : '';
+
+  document.getElementById('zfs-grid').innerHTML = pools.map(p => {
+    const cls = p.used_pct >= 90 ? 'crit' : p.used_pct >= 75 ? 'warn' : '';
+    return `<div class="fs-row">
+      <div class="fs-header">
+        <span class="fs-mount">${escapeHtml(p.pool)} <span class="fs-info">${escapeHtml(p.health || '')}</span></span>
+        <span class="fs-info">${humanBytes(p.alloc)} / ${humanBytes(p.size)} (${p.used_pct.toFixed(1)}%)</span>
+      </div>
+      <div class="fs-bar-track"><div class="fs-bar-fill ${cls}" style="width:${p.used_pct.toFixed(1)}%"></div></div>
+    </div>`;
+  }).join('');
+}
+
+function renderJails(jails) {
+  const card = document.getElementById('card-jails');
+  if (!card) return;
+  if (!jails.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const rows = jails.map(j => `<tr>
+    <td class="proc-pid">${j.jid}</td>
+    <td class="proc-name">${escapeHtml(j.name)}</td>
+    <td class="proc-name">${escapeHtml(j.host || '')}</td>
+    <td class="proc-num">${j.procs}</td>
+  </tr>`).join('');
+  document.getElementById('jails-grid').innerHTML = `<table class="proc-table">
+    <thead><tr><th>JID</th><th>Name</th><th>Hostname</th><th class="proc-num">Procs</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
 }
 
 
@@ -323,7 +384,7 @@ function renderTemps(temps) {
     const pct = Math.min(100, Math.max(0, (t.celsius - 20) / 80 * 100));
     const cls = t.celsius >= 80 ? 'hot' : t.celsius >= 65 ? 'warm' : 'ok';
     return `<div class="temp-row">
-      <span class="temp-name">${t.name}</span>
+      <span class="temp-name">${escapeHtml(t.name)}</span>
       <div class="temp-bar-track"><div class="temp-bar-fill temp-${cls}" style="width:${pct.toFixed(1)}%"></div></div>
       <span class="temp-val temp-${cls}">${t.celsius.toFixed(1)}°C</span>
     </div>`;
@@ -336,7 +397,7 @@ function renderFS(fsList) {
     const cls = f.used_pct >= 90 ? 'crit' : f.used_pct >= 75 ? 'warn' : '';
     return `<div class="fs-row">
       <div class="fs-header">
-        <span class="fs-mount">${f.mount}</span>
+        <span class="fs-mount">${escapeHtml(f.mount)}</span>
         <span class="fs-info">${humanBytes(f.used)} / ${humanBytes(f.total)} (${f.used_pct.toFixed(1)}%)</span>
       </div>
       <div class="fs-bar-track">
@@ -378,46 +439,89 @@ function renderProcs(procs) {
 }
 
 let tabsBuilt = false;
+function renderTabButtons(el, names, current) {
+  el.innerHTML = ['(all)', ...names].map((name, i) => {
+    const val = i === 0 ? '' : name;
+    const active = val === (current ?? '') ? 'active' : '';
+    return `<button class="tab-btn ${active}" data-val="${escapeHtml(val)}">${escapeHtml(name)}</button>`;
+  }).join('');
+}
+
 function buildIfaceTabs(nets, disks) {
   if (tabsBuilt) return;
   tabsBuilt = true;
 
-  const netTabsEl = document.getElementById('iface-tabs');
-  const devTabsEl = document.getElementById('dev-tabs');
-
-  // Net tabs
   const ifaces = [...new Set(nets.map(n => n.iface))].sort();
   if (ifaces.length > 1) {
-    netTabsEl.innerHTML = ['(all)', ...ifaces].map((name, i) => {
-      const val = i === 0 ? '' : name;
-      const active = val === (state.netIface ?? '') ? 'active' : '';
-      return `<button class="tab-btn ${active}" data-val="${val}">${name}</button>`;
-    }).join('');
-    netTabsEl.addEventListener('click', e => {
-      if (!e.target.matches('.tab-btn')) return;
-      state.netIface = e.target.dataset.val || null;
-      netTabsEl.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === e.target));
-      loadNet(state.netIface);
-    });
+    renderTabButtons(document.getElementById('iface-tabs'), ifaces, state.netIface);
   }
-
-  // Disk tabs
   const devs = [...new Set(disks.map(d => d.dev))].sort();
   if (devs.length > 1) {
-    devTabsEl.innerHTML = ['(all)', ...devs].map((name, i) => {
-      const val = i === 0 ? '' : name;
-      const active = val === (state.diskDev ?? '') ? 'active' : '';
-      return `<button class="tab-btn ${active}" data-val="${val}">${name}</button>`;
-    }).join('');
-    devTabsEl.addEventListener('click', e => {
-      if (!e.target.matches('.tab-btn')) return;
-      state.diskDev = e.target.dataset.val || null;
-      devTabsEl.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === e.target));
-      loadDisk(state.diskDev);
-    });
+    renderTabButtons(document.getElementById('dev-tabs'), devs, state.diskDev);
   }
 }
 
+// bindTabClicks attaches one delegated click handler per tab strip, once at
+// init. The buttons themselves are rebuilt by buildIfaceTabs after each range
+// change; re-adding the listener there would stack a duplicate per rebuild.
+function bindTabClicks(id, apply) {
+  const el = document.getElementById(id);
+  el.addEventListener('click', e => {
+    if (!e.target.matches('.tab-btn')) return;
+    el.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === e.target));
+    apply(e.target.dataset.val || null);
+  });
+}
+
+
+// loadAlerts polls /api/alerts (rule states change on the daemon's schedule,
+// not the snapshot stream, so a slow poll is enough). The card stays hidden
+// until alerts are configured or history exists.
+async function loadAlerts() {
+  let d;
+  try {
+    const r = await fetch('/api/alerts');
+    if (!r.ok) return;
+    d = await r.json();
+  } catch { return; }
+  renderAlerts(d);
+}
+
+function renderAlerts(d) {
+  const card = document.getElementById('card-alerts');
+  if (!card) return;
+  const rules = d.rules || [], events = d.events || [];
+  if (!d.enabled && !events.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const firing = rules.filter(r => r.state === 'firing').length;
+  const sum = document.getElementById('alerts-summary');
+  sum.textContent = firing ? `${firing} firing` : 'all clear';
+  sum.style.color = firing ? COLORS.red : COLORS.green;
+
+  const condition = r => {
+    const field = r.field ? `.${r.field}` : '';
+    return `${r.metric}${field} ${r.op} ${r.threshold}`;
+  };
+  document.getElementById('alerts-rules').innerHTML = rules.length ? `<table class="proc-table">
+    <thead><tr><th>Rule</th><th>Condition</th><th>State</th><th class="proc-num">Value</th></tr></thead>
+    <tbody>${rules.map(r => `<tr>
+      <td class="proc-name">${escapeHtml(r.name || r.metric)}</td>
+      <td class="proc-pid">${escapeHtml(condition(r))}</td>
+      <td><span class="alert-badge alert-${r.state}">${r.state}</span></td>
+      <td class="proc-num">${(r.value ?? 0).toFixed(2)}</td>
+    </tr>`).join('')}</tbody>
+  </table>` : '<div style="color:var(--muted)">No rules configured.</div>';
+
+  const evTitle = document.getElementById('alerts-events-title');
+  evTitle.style.display = events.length ? '' : 'none';
+  document.getElementById('alerts-events').innerHTML = events.slice(0, 10).map(ev => `
+    <div class="alert-event">
+      <span class="ev-time">${new Date(ev.ts).toLocaleString()}</span>
+      <span class="ev-state ${escapeHtml(ev.state)}">${escapeHtml(ev.state)}</span>
+      <span class="ev-what">${escapeHtml(ev.rule || ev.metric)}: ${escapeHtml(ev.metric)}${ev.field ? '.' + escapeHtml(ev.field) : ''} = ${(ev.value ?? 0).toFixed(2)} (${escapeHtml(ev.op)} ${ev.threshold})</span>
+    </div>`).join('');
+}
 
 function connectSSE() {
   const dot = document.getElementById('live-dot');
@@ -435,7 +539,33 @@ function connectSSE() {
 }
 
 
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.textContent = t === 'light' ? '☀' : '☾';
+}
+
+// initTheme picks localStorage first, else the OS preference, defaulting dark.
+function initTheme() {
+  const saved = localStorage.getItem('theme');
+  const prefersLight = window.matchMedia &&
+    window.matchMedia('(prefers-color-scheme: light)').matches;
+  applyTheme(saved || (prefersLight ? 'light' : 'dark'));
+}
+
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  localStorage.setItem('theme', next);
+  applyTheme(next);
+  baseOpts.axes = mkAxes();
+  loadAll(); // rebuild charts so axis colours match the new theme
+}
+
 async function init() {
+  // Theme before charts so the first render uses the right axis colours.
+  initTheme();
+  baseOpts.axes = mkAxes();
+
   // Host info
   try {
     const h = await fetch('/api/host').then(r => r.json());
@@ -446,6 +576,10 @@ async function init() {
   // Seed charts from history
   await loadAll();
 
+  // Alert states: initial load + slow poll.
+  loadAlerts();
+  setInterval(loadAlerts, 10000);
+
   // Connect live stream
   connectSSE();
 
@@ -455,6 +589,13 @@ async function init() {
     tabsBuilt = false;
     loadAll();
   });
+
+  // Tab strips: one delegated listener each, for the lifetime of the page.
+  bindTabClicks('iface-tabs', v => { state.netIface = v; loadNet(v); });
+  bindTabClicks('dev-tabs',   v => { state.diskDev = v;  loadDisk(v); });
+
+  // Theme toggle
+  document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
 }
 
 document.addEventListener('DOMContentLoaded', init);

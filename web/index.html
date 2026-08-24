@@ -43,7 +43,10 @@
           <option value="24h">24 hours</option>
         </select>
       </div>
-      <div id="live-dot" class="live-dot" title="Live"></div>
+      <div class="header-controls">
+        <button id="theme-toggle" class="theme-toggle" title="Toggle light / dark" aria-label="Toggle theme">☾</button>
+        <div id="live-dot" class="live-dot" title="Live"></div>
+      </div>
     </div>
   </header>
 
@@ -99,6 +102,23 @@
       <div class="card span2" id="card-proc">
         <h2>Top Processes</h2>
         <div id="proc-table"></div>
+      </div>
+
+      <div class="card span2" id="card-alerts" style="display:none">
+        <h2>Alerts <span class="card-val" id="alerts-summary"></span></h2>
+        <div id="alerts-rules"></div>
+        <div class="alerts-events-title" id="alerts-events-title" style="display:none">Recent events</div>
+        <div id="alerts-events"></div>
+      </div>
+
+      <div class="card span2" id="card-zfs" style="display:none">
+        <h2>ZFS <span class="card-val" id="arc-val"></span></h2>
+        <div id="zfs-grid"></div>
+      </div>
+
+      <div class="card span2" id="card-jails" style="display:none">
+        <h2>Jails</h2>
+        <div id="jails-grid"></div>
       </div>
     </div>
   </main>

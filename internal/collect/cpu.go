@@ -55,3 +55,13 @@ func (c *CPUCollector) Collect() CPUStats {
 func round2(v float64) float64 {
 	return float64(int(v*100+0.5)) / 100
 }
+
+// deltaU64 returns cur-prev as a float64, clamped to 0 when the counter has
+// reset (interface or device recreated under the same name), so the unsigned
+// subtraction can't wrap to ~1.8e19 and poison rates, rollups, and alerts.
+func deltaU64(cur, prev uint64) float64 {
+	if cur < prev {
+		return 0
+	}
+	return float64(cur - prev)
+}

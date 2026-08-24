@@ -73,6 +73,14 @@ func (s *Sampler) collect(t time.Time) Snapshot {
 		Procs:  s.proc.Collect(),
 		Uptime: uptime,
 	}
+	// Opt-in FreeBSD extras (no-ops / stubs elsewhere).
+	if s.cfg.Collect.ZFS {
+		snap.ZFS = collectZFS()
+		snap.ARC = collectARC()
+	}
+	if s.cfg.Collect.Jails {
+		snap.Jails = collectJails()
+	}
 	if load != nil {
 		snap.Load = LoadStats{
 			Load1:  round2(load.Load1),

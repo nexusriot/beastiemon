@@ -4,16 +4,19 @@ import "time"
 
 // Snapshot holds all metrics at a point in time.
 type Snapshot struct {
-	Time   time.Time  `json:"ts"`
-	CPU    CPUStats   `json:"cpu"`
-	Mem    MemStats   `json:"mem"`
-	Net    []NetStats `json:"net"`
+	Time   time.Time   `json:"ts"`
+	CPU    CPUStats    `json:"cpu"`
+	Mem    MemStats    `json:"mem"`
+	Net    []NetStats  `json:"net"`
 	Disk   []DiskStats `json:"disk"`
-	FS     []FSStats  `json:"fs"`
-	Temps  []TempStat `json:"temps,omitempty"`
-	Procs  []ProcStat `json:"procs,omitempty"`
-	Load   LoadStats  `json:"load"`
-	Uptime uint64     `json:"uptime"`
+	FS     []FSStats   `json:"fs"`
+	Temps  []TempStat  `json:"temps,omitempty"`
+	Procs  []ProcStat  `json:"procs,omitempty"`
+	ZFS    []ZFSStats  `json:"zfs,omitempty"`
+	ARC    *ARCStats   `json:"arc,omitempty"`
+	Jails  []JailStat  `json:"jails,omitempty"`
+	Load   LoadStats   `json:"load"`
+	Uptime uint64      `json:"uptime"`
 }
 
 type CPUStats struct {
@@ -78,4 +81,32 @@ type LoadStats struct {
 	Load1  float64 `json:"load1"`
 	Load5  float64 `json:"load5"`
 	Load15 float64 `json:"load15"`
+}
+
+// ZFSStats is per-pool capacity, sourced from `zpool list`. FreeBSD-only.
+type ZFSStats struct {
+	Pool    string  `json:"pool"`
+	Size    uint64  `json:"size"`
+	Alloc   uint64  `json:"alloc"`
+	Free    uint64  `json:"free"`
+	UsedPct float64 `json:"used_pct"`
+	Health  string  `json:"health,omitempty"`
+}
+
+// ARCStats is the ZFS adaptive replacement cache, from kstat sysctls. The
+// hit rate is lifetime (cumulative hits / (hits+misses)). FreeBSD-only.
+type ARCStats struct {
+	Size    uint64  `json:"size"`     // current ARC size in bytes
+	Target  uint64  `json:"target"`   // target size (kstat "c")
+	Max     uint64  `json:"max"`      // maximum size (kstat "c_max")
+	HitRate float64 `json:"hit_rate"` // lifetime hit percentage
+}
+
+// JailStat describes one running jail, from jls(8). FreeBSD-only.
+type JailStat struct {
+	JID   int32  `json:"jid"`
+	Name  string `json:"name"`
+	Host  string `json:"host,omitempty"`
+	Path  string `json:"path,omitempty"`
+	Procs int    `json:"procs"`
 }

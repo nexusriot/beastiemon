@@ -32,15 +32,32 @@ load_rc_config "$name"
 : ${beastied_flags:=""}
 
 pidfile="/var/run/beastied.pid"
+# daemon(8) also writes the *child* (beastied) PID here via -p, so
+# `service beastied reload` can SIGHUP beastied itself (config reload)
+# rather than the supervisor.
+childpidfile="/var/run/beastied_child.pid"
 
 # procname must match the process that OWNS the pidfile.
 # daemon(8) -P writes its own (supervisor) PID, so procname is daemon, not beastied.
 # rc.subr uses procname + pidfile for check_pidfile / pgrep, stop, and status.
 procname="/usr/sbin/daemon"
 command="/usr/sbin/daemon"
-command_args="-f -r -P ${pidfile} -u ${beastied_runas} \
+command_args="-f -r -P ${pidfile} -p ${childpidfile} -u ${beastied_runas} \
     -o ${beastied_logfile} %%PREFIX%%/bin/beastied \
     -config ${beastied_config} ${beastied_flags}"
+
+# `service beastied reload` hot-reloads the config (auth, alerts, sampler
+# options) without a restart by sending SIGHUP straight to beastied.
+extra_commands="reload"
+reload_cmd="beastied_reload"
+beastied_reload() {
+    if [ -f "${childpidfile}" ]; then
+        kill -HUP "$(cat "${childpidfile}")" && echo "beastied: configuration reloaded"
+    else
+        echo "beastied: ${childpidfile} not found; is it running?"
+        return 1
+    fi
+}
 
 start_precmd="beastied_prestart"
 beastied_prestart() {
