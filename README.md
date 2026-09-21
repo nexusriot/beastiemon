@@ -221,6 +221,7 @@ fs_include = ["/", "/var", "/usr", "/tmp"]
 net_exclude = ["lo0"]
 
 # Number of processes shown in the "Top Processes" panel, ranked by CPU%.
+# The kernel "idle" process is always excluded.
 top_procs = 5
 
 # FreeBSD-only extra panels, off by default. Each shells out (zpool / jls / ps)
@@ -316,7 +317,8 @@ The default (`raw`) posts the alert as JSON:
 ```
 
 Alert activity is also visible without a webhook: `GET /api/alerts` reports
-each rule's live state (`ok` / `pending` / `firing`, with the current value)
+each rule's live state (`ok` / `pending` / `firing` / `unknown`, with the
+current value)
 plus recent events, and the dashboard shows both in an **Alerts** card. Events
 are kept in memory (last 200) — or in SQLite when `[store]` is enabled, where
 they survive restarts and age out with `retention`.
@@ -503,7 +505,10 @@ file or `less`, or setting the `NO_COLOR` environment variable, yields clean
 plain text automatically.
 
 `top_procs` from the config controls how many processes `beastie proc`
-and the full status output display.
+and the full status output display. The kernel `idle` process is excluded: it
+accrues a core-second per core per second by definition, so it would sit at the
+top of every list without ever telling you anything — the same reason `top(1)`
+hides idle threads unless you ask for them.
 
 ### JSON output
 
@@ -548,8 +553,8 @@ for charts.
 - **Filesystems** — usage progress bars per mount.
 - **Top Processes** — live-updating table of `top_procs` processes by
   CPU%, with PID, name, CPU%, MEM%, RSS.
-- **Alerts** — rule table (name, condition, ok/pending/firing badge, current
-  value — the sampler watchdog included) plus the most recent events. Hidden
+- **Alerts** — rule table (name, condition, ok/pending/firing/unknown badge,
+  current value — the sampler watchdog included) plus the most recent events. Hidden
   until `[alerts]` rules or `stale_after` are configured; refreshes every 10 s.
 - **ZFS** — per-pool usage bars plus an ARC size / hit-rate summary. Hidden
   unless `[collect] zfs = true` and pools exist.
@@ -648,8 +653,12 @@ Current alert-rule states plus recent events (`?limit=`, default 50, max 500):
 }
 ```
 
-`state` is `ok`, `pending` (condition true, `for` not yet elapsed), or
-`firing`. The `stale_after` watchdog appears as a rule named `watchdog`.
+`state` is `ok`, `pending` (condition true, `for` not yet elapsed), `firing`,
+or `unknown` — the metric could not be read on the last tick (a mount that
+isn't mounted, a host with no temperature sensors, a typo in `metric`/`field`),
+so the rule isn't watching anything. Rules that can never fire because of such
+a typo are also logged once at startup and on each reload.
+The `stale_after` watchdog appears as a rule named `watchdog`.
 Events come from SQLite when `[store]` is enabled (surviving restarts), else
 from the engine's in-memory history; `enabled` is `false` when no alerts are
 configured. The dashboard's Alerts card is a client of this endpoint.

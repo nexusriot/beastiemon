@@ -311,3 +311,120 @@ func TestWatchdog(t *testing.T) {
 		t.Fatalf("watchdog re-fired too early after resolve: %+v", events)
 	}
 }
+
+// A rule whose metric can't be read (a mount that isn't mounted, sensors that
+// don't exist, a typo) must not read "ok" — that is indistinguishable from a
+// healthy rule and hides the misconfiguration.
+func TestStatesUnknownWhenMetricUnreadable(t *testing.T) {
+	cfg := config.AlertsConfig{Webhook: "http://h", Rules: []config.AlertRule{
+		{Name: "missing-mount", Metric: "fs", Field: "/nope", Op: ">", Threshold: 1},
+		{Name: "no-sensors", Metric: "temp", Field: "max", Op: ">", Threshold: 1},
+		{Name: "typo-metric", Metric: "banana", Op: ">", Threshold: 1},
+	}}
+	e := New(cfg)
+	e.post = func(string, string, Event) {}
+
+	// Before any snapshot every rule reads "ok": nothing has failed yet.
+	for _, st := range e.States() {
+		if st.State != "ok" {
+			t.Fatalf("%s: want ok before first eval, got %q", st.Name, st.State)
+		}
+	}
+
+	snap := collect.Snapshot{
+		Time: time.Now(),
+		FS:   []collect.FSStats{{Mount: "/", UsedPct: 50}},
+	}
+	e.Eval(snap)
+	for _, st := range e.States() {
+		if st.State != "unknown" {
+			t.Fatalf("%s: want unknown, got %q", st.Name, st.State)
+		}
+	}
+
+	// A readable rule alongside them still reports normally.
+	cfg.Rules = append(cfg.Rules, config.AlertRule{
+		Name: "root", Metric: "fs", Field: "/", Op: ">", Threshold: 1,
+	})
+	e2 := New(cfg)
+	e2.post = func(string, string, Event) {}
+	e2.Eval(snap)
+	st := e2.States()
+	if got := st[len(st)-1]; got.State != "firing" || got.Value != 50 {
+		t.Fatalf("readable rule: want firing value=50, got %+v", got)
+	}
+}
+
+// A rule that recovers from unreadable back to readable returns to "ok".
+func TestStatesUnknownClearsWhenMetricReturns(t *testing.T) {
+	cfg := config.AlertsConfig{Rules: []config.AlertRule{
+		{Name: "root", Metric: "fs", Field: "/", Op: ">", Threshold: 90},
+	}}
+	e := New(cfg)
+	e.post = func(string, string, Event) {}
+
+	e.Eval(collect.Snapshot{Time: time.Now()}) // no FS entries at all
+	if st := e.States(); st[0].State != "unknown" {
+		t.Fatalf("want unknown, got %q", st[0].State)
+	}
+	e.Eval(collect.Snapshot{Time: time.Now(), FS: []collect.FSStats{{Mount: "/", UsedPct: 10}}})
+	if st := e.States(); st[0].State != "ok" {
+		t.Fatalf("want ok after metric returns, got %q", st[0].State)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name string
+		rule config.AlertRule
+		want string // substring the warning must contain; "" = no warning
+	}{
+		{"good cpu", config.AlertRule{Name: "a", Metric: "cpu", Field: "total", Op: ">"}, ""},
+		{"good default field", config.AlertRule{Name: "a", Metric: "mem", Op: ">="}, ""},
+		{"good fs mount", config.AlertRule{Name: "a", Metric: "fs", Field: "/var", Op: "<"}, ""},
+		{"good temp name", config.AlertRule{Name: "a", Metric: "temp", Field: "cpu0", Op: "<="}, ""},
+		{"good eq", config.AlertRule{Name: "a", Metric: "load", Field: "load5", Op: "=="}, ""},
+		{"bad op", config.AlertRule{Name: "a", Metric: "cpu", Field: "total", Op: "=~"}, "unsupported op"},
+		{"empty op", config.AlertRule{Name: "a", Metric: "cpu", Field: "total"}, "unsupported op"},
+		{"bad metric", config.AlertRule{Name: "a", Metric: "banana", Op: ">"}, "unknown metric"},
+		{"bad field", config.AlertRule{Name: "a", Metric: "cpu", Field: "totl", Op: ">"}, `has no field "totl"`},
+		{"bad net field", config.AlertRule{Name: "a", Metric: "net", Field: "rx", Op: ">"}, `has no field "rx"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Validate(config.AlertsConfig{Rules: []config.AlertRule{tc.rule}})
+			if tc.want == "" {
+				if len(got) != 0 {
+					t.Fatalf("want no warnings, got %v", got)
+				}
+				return
+			}
+			if len(got) != 1 || !strings.Contains(got[0], tc.want) {
+				t.Fatalf("want a warning containing %q, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+// Validate's field table must stay in step with metricValue's switch: a field
+// Validate accepts has to actually resolve, and one it rejects must not.
+func TestValidateMatchesMetricValue(t *testing.T) {
+	snap := collect.Snapshot{
+		CPU:  collect.CPUStats{Total: 1},
+		Disk: []collect.DiskStats{{Device: "ada0"}},
+		Net:  []collect.NetStats{{Interface: "em0"}},
+	}
+	for metric, fields := range metricFields {
+		if fields == nil {
+			continue // keyed by entry name; nothing fixed to cross-check
+		}
+		for _, f := range fields {
+			if _, ok := metricValue(snap, metric, f); !ok {
+				t.Errorf("Validate accepts %s.%q but metricValue rejects it", metric, f)
+			}
+		}
+		if _, ok := metricValue(snap, metric, "definitely-not-a-field"); ok {
+			t.Errorf("metricValue accepts %s.definitely-not-a-field but Validate would reject it", metric)
+		}
+	}
+}

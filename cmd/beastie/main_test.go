@@ -178,3 +178,18 @@ func TestFetchRemoteNoData(t *testing.T) {
 		t.Fatal("503 should surface as an error")
 	}
 }
+
+// Every command the usage text advertises as a metric view must be accepted;
+// anything else falls through to the "unknown command" exit-2 path.
+func TestMetricCommands(t *testing.T) {
+	for _, c := range []string{"status", "cpu", "mem", "net", "disk", "fs", "temp", "proc", "load"} {
+		if !metricCommands[c] {
+			t.Errorf("command %q should be recognised", c)
+		}
+	}
+	for _, c := range []string{"", "frobnicate", "top", "check", "version", "help", "CPU"} {
+		if metricCommands[c] {
+			t.Errorf("command %q should not be in metricCommands", c)
+		}
+	}
+}

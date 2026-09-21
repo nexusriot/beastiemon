@@ -251,6 +251,14 @@ func printAll(snap collect.Snapshot) {
 	printProcs(snap)
 }
 
+// metricCommands are the commands that render one part of a snapshot. Anything
+// outside this set (and the verbs main handles explicitly) is a typo, not a
+// request for the default status view.
+var metricCommands = map[string]bool{
+	"status": true, "cpu": true, "mem": true, "net": true, "disk": true,
+	"fs": true, "temp": true, "proc": true, "load": true,
+}
+
 // emitJSON prints the part of the snapshot relevant to cmd as indented JSON.
 // Sub-objects reuse the same struct tags as the daemon's /api/metrics, so
 // CLI and API output are byte-identical for a given metric.
@@ -624,6 +632,11 @@ func main() {
 		}
 
 	default:
+		if !metricCommands[cmd] {
+			fmt.Fprintf(os.Stderr, "beastie: unknown command %q\n", cmd)
+			fmt.Fprintln(os.Stderr, "Run 'beastie help' for usage.")
+			os.Exit(2)
+		}
 		if *jsonOut {
 			emitJSON(cmd, mustSnap(getSnap))
 			return

@@ -73,13 +73,21 @@ func (c *ProcCollector) Collect() []ProcStat {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].cpuPct > entries[j].cpuPct
 	})
-	if len(entries) > c.topN {
-		entries = entries[:c.topN]
-	}
-
-	out := make([]ProcStat, 0, len(entries))
+	// Enrich in rank order and stop at topN. Doing it here rather than by
+	// pre-truncating lets skipped entries (see below) fall through to the next
+	// candidate instead of shortening the list.
+	out := make([]ProcStat, 0, c.topN)
 	for _, e := range entries {
+		if len(out) == c.topN {
+			break
+		}
 		name, _ := e.p.Name()
+		// FreeBSD's idle process accrues one core-second per core per second,
+		// so it pins ~100%×ncpu and would permanently own the top slot while
+		// telling the operator nothing. top(1) hides it by default too.
+		if name == "idle" {
+			continue
+		}
 		var rss uint64
 		if mi, err := e.p.MemoryInfo(); err == nil && mi != nil {
 			rss = mi.RSS

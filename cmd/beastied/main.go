@@ -67,6 +67,11 @@ func main() {
 			srv.SetAlerts(nil)
 			return
 		}
+		// A typo in metric/field/op makes a rule silently never fire, which
+		// looks exactly like a rule that is simply never tripping. Say so.
+		for _, w := range alert.Validate(ac) {
+			log.Printf("config: %s", w)
+		}
 		alerts = alert.New(ac)
 		if hist != nil {
 			alerts.SetSink(persistEvent(hist))

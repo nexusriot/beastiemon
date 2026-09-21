@@ -38,8 +38,9 @@ vendor-js:
 	    -e 's|https://unpkg.com/uplot@[^/]*/dist/uPlot.iife.min.js|vendor/uplot.iife.min.js|g' \
 	    -e 's|https://unpkg.com/uplot@[^/]*/dist/uPlot.min.css|vendor/uplot.min.css|g' \
 	    web/index.html
-	# Ensure assets.go embeds the vendor directory too.
-	sed -i '' 's|//go:embed index.html app.js style.css|//go:embed index.html app.js style.css vendor|' \
+	# Ensure assets.go embeds the vendor directory too. The $$ anchor keeps
+	# this idempotent: a second `gmake all` must not append " vendor" again.
+	sed -i '' 's|//go:embed index.html app.js style.css$$|//go:embed index.html app.js style.css vendor|' \
 	    web/assets.go
 
 build:

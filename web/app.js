@@ -34,13 +34,24 @@ function cssVar(name, fallback) {
   return v || fallback;
 }
 
-// mkAxes builds x/y axis styling from the current theme's CSS variables.
-// Called at load and again on theme toggle (charts are rebuilt).
+// mkAxes builds a fresh x/y axis pair from the current theme's CSS variables.
+// Every chart gets its own pair: uPlot mutates the axis objects it is handed,
+// so sharing one pair across charts lets them corrupt each other's state.
 function mkAxes() {
   const stroke = cssVar('--muted', '#8b949e');
   const grid = cssVar('--border', '#30363d');
   const base = { stroke, grid: { stroke: grid, width: 1 }, ticks: { show: false }, font: '10px monospace' };
   return [{ ...base }, { ...base, size: 52 }];
+}
+
+// axesFor themes a chart's axes and installs its y-tick formatter. `size`
+// widens the y gutter for labels longer than the 52px default — without it
+// uPlot clips "1.0 GB/s" down to unreadable stubs like ",000,000".
+function axesFor(fmt, size) {
+  const [x, y] = mkAxes();
+  if (fmt) y.values = (u, vals) => vals.map(v => v != null ? fmt(v) : '');
+  if (size) y.size = size;
+  return [x, y];
 }
 
 const baseOpts = {
@@ -49,13 +60,17 @@ const baseOpts = {
   padding: [8, 0, 0, 0],
   cursor: { show: true, sync: { key: 'bm' } },
   select: { show: false },
-  axes: mkAxes(),
   legend: { show: true, live: true },
 };
 
+// makeOpts merges a chart's options over the shared defaults. It must not
+// clobber `extra.axes`: those carry the per-metric tick formatter (%, bytes,
+// load), and overwriting them leaves every chart with raw unformatted numbers.
 function makeOpts(extra) {
-  return Object.assign({}, baseOpts, extra,
-    { axes: baseOpts.axes, cursor: baseOpts.cursor });
+  const opts = Object.assign({}, baseOpts, extra);
+  opts.axes = extra.axes || mkAxes();
+  opts.cursor = baseOpts.cursor;
+  return opts;
 }
 
 // Resize observer to make charts fill their container.
@@ -97,10 +112,7 @@ function buildCPUChart(data) {
       { label: 'max', stroke: 'rgba(248,81,73,0.35)', width: 0.5, points: { show: false } },
     ],
     bands: [{ series: [6, 5], fill: 'rgba(248,81,73,0.10)' }],
-    axes: [
-      baseOpts.axes[0],
-      { ...baseOpts.axes[1], values: (u, vals) => vals.map(v => v != null ? v.toFixed(0)+'%' : '') },
-    ],
+    axes: axesFor(v => v.toFixed(0) + '%'),
     scales: { y: { range: [0, 100] } },
   });
 
@@ -121,10 +133,7 @@ function buildLoadChart(data) {
       { label: '5m',  stroke: COLORS.orange, width: 1.5 },
       { label: '15m', stroke: COLORS.muted,  width: 1 },
     ],
-    axes: [
-      baseOpts.axes[0],
-      { ...baseOpts.axes[1], values: (u, vals) => vals.map(v => v != null ? v.toFixed(2) : '') },
-    ],
+    axes: axesFor(v => v.toFixed(2)),
   });
 
   state.charts.load = new uPlot(opts, data, el);
@@ -144,10 +153,7 @@ function buildMemChart(data) {
       { label: 'Free',      stroke: COLORS.green,  fill: 'rgba(63,185,80,0.12)', width: 1.5 },
       { label: 'Swap Used', stroke: COLORS.orange, width: 1.5, dash: [4,2] },
     ],
-    axes: [
-      baseOpts.axes[0],
-      { ...baseOpts.axes[1], values: (u, vals) => vals.map(v => v != null ? humanBytes(v) : '') },
-    ],
+    axes: axesFor(humanBytes, 66),
   });
 
   state.charts.mem = new uPlot(opts, data, el);
@@ -166,10 +172,7 @@ function buildNetChart(data) {
       { label: 'RX', stroke: COLORS.green, fill: 'rgba(63,185,80,0.12)', width: 1.5 },
       { label: 'TX', stroke: COLORS.blue,  fill: 'rgba(88,166,255,0.1)', width: 1.5 },
     ],
-    axes: [
-      baseOpts.axes[0],
-      { ...baseOpts.axes[1], values: (u, vals) => vals.map(v => v != null ? humanBytes(v)+'/s' : '') },
-    ],
+    axes: axesFor(v => humanBytes(v) + '/s', 74),
   });
 
   state.charts.net = new uPlot(opts, data, el);
@@ -188,10 +191,7 @@ function buildDiskChart(data) {
       { label: 'Read',  stroke: COLORS.cyan,   fill: 'rgba(57,211,242,0.1)', width: 1.5 },
       { label: 'Write', stroke: COLORS.purple,  fill: 'rgba(188,140,255,0.1)',width: 1.5 },
     ],
-    axes: [
-      baseOpts.axes[0],
-      { ...baseOpts.axes[1], values: (u, vals) => vals.map(v => v != null ? humanBytes(v)+'/s' : '') },
-    ],
+    axes: axesFor(v => humanBytes(v) + '/s', 74),
   });
 
   state.charts.disk = new uPlot(opts, data, el);
@@ -239,6 +239,12 @@ async function loadAll() {
 function appendToChart(chart, ts, values) {
   if (!chart) return;
   const data = chart.data;
+  // uPlot requires a strictly ascending x series (its cursor and range code
+  // binary-search it). The newest row seeded from /api/series is the same
+  // sample the first live frame carries, so drop anything that doesn't
+  // advance the timeline rather than plotting it twice.
+  const last = data[0][data[0].length - 1];
+  if (last != null && ts <= last) return;
   // Append to each series.
   data[0].push(ts);
   for (let i = 0; i < values.length; i++) {
@@ -261,7 +267,9 @@ function rangeSeconds() {
 
 function applyLiveSnap(snap) {
   state.latestSnap = snap;
-  const ts = new Date(snap.ts).getTime() / 1000;
+  // Whole seconds, matching the integer Unix timestamps /api/series returns,
+  // so seeded history and live points share one grid.
+  const ts = Math.floor(new Date(snap.ts).getTime() / 1000);
 
   // CPU summary
   const cpuPct = snap.cpu?.total ?? 0;
@@ -557,14 +565,12 @@ function toggleTheme() {
   const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
   localStorage.setItem('theme', next);
   applyTheme(next);
-  baseOpts.axes = mkAxes();
   loadAll(); // rebuild charts so axis colours match the new theme
 }
 
 async function init() {
   // Theme before charts so the first render uses the right axis colours.
   initTheme();
-  baseOpts.axes = mkAxes();
 
   // Host info
   try {

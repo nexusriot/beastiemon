@@ -610,6 +610,23 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// secondsCut is the whole-second timestamp of the oldest ring sample, the
+// boundary store rows must fall strictly before to be included.
+func secondsCut(ringSnaps []collect.Snapshot) int64 {
+	if len(ringSnaps) == 0 {
+		return 0
+	}
+	return ringSnaps[0].Time.Unix()
+}
+
+// olderThan compares at whole-second resolution because that is what the wire
+// format carries. Store rows are bucket-truncated while ring samples keep
+// sub-second precision, so a bucket can be strictly before the oldest ring
+// sample as a time.Time yet land on the same Unix second — emitting it would
+// give /api/series two rows with an identical timestamp, and uPlot (like any
+// consumer that binary-searches x) requires a strictly ascending x series.
+func olderThan(t time.Time, cut int64) bool { return t.Unix() < cut }
+
 // snapsSince returns snapshots at or after `since`, oldest first. It serves
 // the full-resolution ring for the recent window and, when a history store is
 // attached, prepends the store's (rolled-up) rows for the portion older than
@@ -625,10 +642,10 @@ func (s *Server) snapsSince(since time.Time) []collect.Snapshot {
 	}
 	// The ring wins where they overlap: keep store rows strictly older than
 	// the oldest ring sample, then append the ring.
-	cut := ringSnaps[0].Time
+	cut := secondsCut(ringSnaps)
 	out := make([]collect.Snapshot, 0, len(storeSnaps)+len(ringSnaps))
 	for _, sn := range storeSnaps {
-		if sn.Time.Before(cut) {
+		if olderThan(sn.Time, cut) {
 			out = append(out, sn)
 		}
 	}
@@ -641,11 +658,8 @@ func (s *Server) snapsSince(since time.Time) []collect.Snapshot {
 // portion is full-resolution, so its min and max are the sample itself.
 func (s *Server) snapsBanded(since time.Time) (avg, lo, hi []collect.Snapshot) {
 	ringSnaps := s.ring.Since(since)
-	cut := time.Time{}
-	if len(ringSnaps) > 0 {
-		cut = ringSnaps[0].Time
-	}
-	older := func(t time.Time) bool { return len(ringSnaps) == 0 || t.Before(cut) }
+	cut := secondsCut(ringSnaps)
+	older := func(t time.Time) bool { return len(ringSnaps) == 0 || olderThan(t, cut) }
 
 	if rs, isRollup := s.store.(RollupStore); isRollup {
 		sAvg, sLo, sHi := rs.RollupSince(since)

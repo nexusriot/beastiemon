@@ -301,3 +301,76 @@ func TestAlertsEndpoint(t *testing.T) {
 		t.Fatalf("event: %+v", on.Events[0])
 	}
 }
+
+// fakeStore is a HistoryStore + RollupStore whose rows the test controls, so
+// the store↔ring merge can be exercised without SQLite.
+type fakeStore struct{ rows []collect.Snapshot }
+
+func (f *fakeStore) Push(collect.Snapshot) {}
+
+func (f *fakeStore) Since(t time.Time) []collect.Snapshot {
+	var out []collect.Snapshot
+	for _, s := range f.rows {
+		if !s.Time.Before(t) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (f *fakeStore) RollupSince(t time.Time) (avg, lo, hi []collect.Snapshot) {
+	rows := f.Since(t)
+	return rows, rows, rows
+}
+
+// The store writes bucket-truncated timestamps while the ring keeps sub-second
+// precision, so a store bucket can be strictly earlier as a time.Time yet land
+// on the same whole second as the oldest ring sample. /api/series renders
+// whole seconds, so emitting both produces a duplicate x value — and uPlot
+// requires a strictly ascending x series.
+func TestSeriesStoreRingSeamHasNoDuplicateTimestamps(t *testing.T) {
+	bucket := time.Now().Truncate(10 * time.Second).Add(-30 * time.Second)
+	s := testServer(config.AuthConfig{})
+	s.SetStore(&fakeStore{rows: []collect.Snapshot{
+		sampleSnap(bucket),
+		sampleSnap(bucket.Add(10 * time.Second)),
+		// Same whole second as the first ring sample below, 336ms earlier.
+		sampleSnap(bucket.Add(20 * time.Second)),
+	}})
+	// Ring samples carry sub-second precision, as the sampler produces them.
+	s.Ingest(sampleSnap(bucket.Add(20*time.Second + 336*time.Millisecond)))
+	s.Ingest(sampleSnap(bucket.Add(21*time.Second + 336*time.Millisecond)))
+
+	for _, path := range []string{
+		"/api/series?metric=cpu&range=1h",
+		"/api/series?metric=cpu&range=1h&band=1",
+		"/api/series?metric=mem&range=1h",
+	} {
+		rec := get(s, path, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: want 200, got %d", path, rec.Code)
+		}
+		var resp struct {
+			Labels []string    `json:"labels"`
+			Data   [][]float64 `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("%s: decode: %v", path, err)
+		}
+		ts := resp.Data[0]
+		if len(ts) != 4 {
+			t.Fatalf("%s: want 4 rows (2 store + 2 ring), got %d: %v", path, len(ts), ts)
+		}
+		for i := 1; i < len(ts); i++ {
+			if ts[i] <= ts[i-1] {
+				t.Fatalf("%s: timestamps not strictly ascending at %d: %v", path, i, ts)
+			}
+		}
+		// Every column must stay index-aligned with the timestamp column.
+		for i, col := range resp.Data {
+			if len(col) != len(ts) {
+				t.Fatalf("%s: column %d has %d rows, want %d", path, i, len(col), len(ts))
+			}
+		}
+	}
+}

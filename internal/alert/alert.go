@@ -40,12 +40,17 @@ type ruleState struct {
 	firing    bool      // whether a "firing" event has been sent and not yet resolved
 	lastFire  time.Time // when the most recent "firing" event was sent (for Repeat)
 	lastValue float64   // most recently evaluated value (for /api/alerts)
-	lastOK    bool      // whether the metric was readable on the last tick
+	// lastOK records whether the metric was readable on the last tick. It
+	// starts true so a rule reads "ok" in the window before the first
+	// snapshot arrives, rather than flashing "unknown" at every startup.
+	lastOK bool
 }
 
 // RuleStatus is one rule's current state as reported by States (and served at
 // /api/alerts). State is "ok", "pending" (condition true, For not yet
-// elapsed), or "firing".
+// elapsed), "firing", or "unknown" (the metric could not be read on the last
+// tick — a missing mount, absent sensors, or a typo in metric/field — so the
+// rule is not actually watching anything).
 type RuleStatus struct {
 	Name      string    `json:"name"`
 	Metric    string    `json:"metric"`
@@ -109,7 +114,7 @@ func New(cfg config.AlertsConfig) *Engine {
 		if fm == "" {
 			fm = cfg.Format
 		}
-		e.rules = append(e.rules, ruleState{rule: r, webhook: wh, format: fm})
+		e.rules = append(e.rules, ruleState{rule: r, webhook: wh, format: fm, lastOK: true})
 	}
 	e.post = e.httpPost
 	return e
@@ -244,10 +249,15 @@ func (e *Engine) States() []RuleStatus {
 	out := make([]RuleStatus, 0, len(e.rules)+1)
 	for i := range e.rules {
 		rs := &e.rules[i]
+		// "unknown" outranks "ok": a rule whose metric is unreadable has never
+		// tested its threshold, and reporting it green hides the failure.
 		state := "ok"
-		if rs.firing {
+		switch {
+		case rs.firing:
 			state = "firing"
-		} else if !rs.since.IsZero() {
+		case !rs.lastOK:
+			state = "unknown"
+		case !rs.since.IsZero():
 			state = "pending"
 		}
 		out = append(out, RuleStatus{
@@ -486,6 +496,63 @@ func maxOrNamed[T any](field string, items []T, f func(T) (string, float64)) (fl
 		}
 	}
 	return 0, false
+}
+
+// metricFields lists the fields each rule metric accepts, mirroring
+// metricValue's switch. A nil list means the metric is keyed by entry name
+// (a mount point, a sensor) and so accepts any field, plus "max"/"".
+var metricFields = map[string][]string{
+	"cpu":  {"", "total", "user", "sys", "idle"},
+	"mem":  {"", "used_pct", "used", "free"},
+	"swap": {"", "pct", "used"},
+	"load": {"", "load1", "load5", "load15"},
+	"disk": {"", "read_bps", "write_bps", "read_iops", "write_iops"},
+	"net":  {"", "rx_bps", "tx_bps", "rx_pps", "tx_pps"},
+	"fs":   nil,
+	"temp": nil,
+}
+
+var validOps = []string{">", ">=", "<", "<=", "=="}
+
+// Validate reports rules that can never fire because of a typo — an unknown
+// metric, an unsupported operator, or a field the metric doesn't have. These
+// don't stop the daemon (the rest of the config is still good), but left
+// silent they look identical to a rule that is simply never tripping, so the
+// daemon logs them at startup and on reload.
+func Validate(cfg config.AlertsConfig) []string {
+	var warns []string
+	for _, r := range cfg.Rules {
+		name := r.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		if !contains(validOps, r.Op) {
+			warns = append(warns, fmt.Sprintf(
+				"alert rule %q: unsupported op %q (want one of %s) — it will never fire",
+				name, r.Op, strings.Join(validOps, " ")))
+		}
+		fields, known := metricFields[r.Metric]
+		if !known {
+			warns = append(warns, fmt.Sprintf(
+				"alert rule %q: unknown metric %q — it will never fire", name, r.Metric))
+			continue
+		}
+		if fields != nil && !contains(fields, r.Field) {
+			warns = append(warns, fmt.Sprintf(
+				"alert rule %q: metric %q has no field %q (want one of %s) — it will never fire",
+				name, r.Metric, r.Field, strings.Join(fields[1:], " ")))
+		}
+	}
+	return warns
+}
+
+func contains(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 func diskField(field string) (func(collect.DiskStats) float64, bool) {
