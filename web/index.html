@@ -44,6 +44,7 @@
         </select>
       </div>
       <div class="header-controls">
+        <button id="pause-toggle" class="theme-toggle" title="Freeze the live view" aria-label="Freeze live updates">⏸</button>
         <button id="theme-toggle" class="theme-toggle" title="Toggle light / dark" aria-label="Toggle theme">☾</button>
         <div id="live-dot" class="live-dot" title="Live"></div>
       </div>
@@ -53,11 +54,17 @@
   <main>
     <div class="grid">
       <div class="card span2" id="card-cpu">
-        <h2>CPU <span class="card-val" id="cpu-pct">—</span></h2>
+        <h2>CPU <span class="card-val" id="cpu-pct">—</span>
+          <button class="card-act" data-export="cpu" title="Download this chart as CSV">⤓</button></h2>
         <div id="chart-cpu"></div>
+        <!-- Per-core bars come from the live stream, not /api/series: the
+             server would otherwise send one column per core (tripled under
+             band=1) on every range change for data no chart plots. -->
+        <div id="cpu-cores" class="core-strip"></div>
       </div>
       <div class="card" id="card-load">
-        <h2>Load Average</h2>
+        <h2>Load Average
+          <button class="card-act" data-export="load" title="Download this chart as CSV">⤓</button></h2>
         <div id="chart-load"></div>
         <div class="load-vals">
           <span id="load1">—</span>
@@ -68,7 +75,8 @@
       </div>
 
       <div class="card span2" id="card-mem">
-        <h2>Memory <span class="card-val" id="mem-pct">—</span></h2>
+        <h2>Memory <span class="card-val" id="mem-pct">—</span>
+          <button class="card-act" data-export="mem" title="Download this chart as CSV">⤓</button></h2>
         <div id="chart-mem"></div>
         <div class="mem-legend">
           <span class="dot used"></span>Used
@@ -78,13 +86,15 @@
       </div>
 
       <div class="card span2" id="card-net">
-        <h2>Network</h2>
+        <h2>Network
+          <button class="card-act" data-export="net" title="Download this chart as CSV">⤓</button></h2>
         <div id="chart-net"></div>
         <div class="iface-tabs" id="iface-tabs"></div>
       </div>
 
       <div class="card span2" id="card-disk">
-        <h2>Disk I/O</h2>
+        <h2>Disk I/O
+          <button class="card-act" data-export="disk" title="Download this chart as CSV">⤓</button></h2>
         <div id="chart-disk"></div>
         <div class="iface-tabs" id="dev-tabs"></div>
       </div>
@@ -102,6 +112,15 @@
       <div class="card span2" id="card-proc">
         <h2>Top Processes</h2>
         <div id="proc-table"></div>
+        <!-- Watched processes sit here rather than in their own card: they
+             answer a question about processes, and the list is usually two
+             or three names. -->
+        <div id="watch-grid"></div>
+      </div>
+
+      <div class="card" id="card-pf" style="display:none">
+        <h2>pf <span class="card-val" id="pf-states"></span></h2>
+        <div id="pf-grid"></div>
       </div>
 
       <div class="card span2" id="card-alerts" style="display:none">
@@ -114,6 +133,7 @@
       <div class="card span2" id="card-zfs" style="display:none">
         <h2>ZFS <span class="card-val" id="arc-val"></span></h2>
         <div id="zfs-grid"></div>
+        <div id="dataset-grid"></div>
       </div>
 
       <div class="card span2" id="card-jails" style="display:none">

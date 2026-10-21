@@ -1,6 +1,7 @@
 package collect
 
 import (
+	"sort"
 	"time"
 
 	psutil "github.com/shirou/gopsutil/v3/net"
@@ -51,9 +52,21 @@ func (n *NetCollector) Collect() []NetStats {
 				TxBps:     round2(deltaU64(c.BytesSent, p.BytesSent) / dt),
 				RxPps:     round2(deltaU64(c.PacketsRecv, p.PacketsRecv) / dt),
 				TxPps:     round2(deltaU64(c.PacketsSent, p.PacketsSent) / dt),
+				// Already in the counters we just read; errors and drops are
+				// what actually diagnoses a flaky NIC or a full queue.
+				RxErr:  round2(deltaU64(c.Errin, p.Errin) / dt),
+				TxErr:  round2(deltaU64(c.Errout, p.Errout) / dt),
+				RxDrop: round2(deltaU64(c.Dropin, p.Dropin) / dt),
+				TxDrop: round2(deltaU64(c.Dropout, p.Dropout) / dt),
 			})
 		}
 	}
+
+	// Rates are gathered by ranging over a map, so without this the array
+	// order is reshuffled on every tick — churning /api/metrics, each SSE
+	// frame, `beastie --json net`, and the first-seen key order the rollup
+	// aggregator relies on to keep stored buckets stable.
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Interface < stats[j].Interface })
 
 	n.prev = cur
 	n.prevAt = now

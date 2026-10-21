@@ -374,3 +374,136 @@ func TestSeriesStoreRingSeamHasNoDuplicateTimestamps(t *testing.T) {
 		}
 	}
 }
+
+func pfSnap(t time.Time) collect.Snapshot {
+	snap := sampleSnap(t)
+	snap.Net[0].RxErr = 3
+	snap.Net[0].TxDrop = 1
+	snap.CPU.PerCore = []float64{10, 20, 30, 40}
+	snap.PF = &collect.PFStats{
+		Enabled: true, States: 500, StateLimit: 10000, StatePct: 5,
+		MatchRate: 54, SearchRate: 4362, DropRate: 2,
+	}
+	snap.Watch = []collect.ProcWatch{{Name: "sshd", Count: 1}, {Name: "nginx", Count: 0}}
+	snap.Datasets = []collect.ZFSDataset{{Name: "zroot/var", Used: 900, Avail: 100}}
+	return snap
+}
+
+func seriesOf(t *testing.T, s *Server, path string) (labels []string, data [][]float64) {
+	t.Helper()
+	rec := get(s, path, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s: want 200, got %d", path, rec.Code)
+	}
+	var resp struct {
+		Labels []string    `json:"labels"`
+		Data   [][]float64 `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("%s: decode: %v", path, err)
+	}
+	return resp.Labels, resp.Data
+}
+
+func TestSeriesNetErr(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	s.Ingest(pfSnap(time.Now()))
+
+	labels, data := seriesOf(t, s, "/api/series?metric=neterr&range=1h")
+	want := []string{"ts", "rx_err", "tx_err", "rx_drop", "tx_drop"}
+	if len(labels) != len(want) {
+		t.Fatalf("labels: want %v, got %v", want, labels)
+	}
+	if data[1][0] != 3 || data[4][0] != 1 {
+		t.Fatalf("want rx_err 3 and tx_drop 1, got %v", data)
+	}
+}
+
+func TestSeriesPF(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	s.Ingest(pfSnap(time.Now()))
+
+	labels, data := seriesOf(t, s, "/api/series?metric=pf&range=1h")
+	if len(labels) != 5 || labels[1] != "states" || labels[4] != "drop_rate" {
+		t.Fatalf("labels: %v", labels)
+	}
+	if data[1][0] != 500 || data[4][0] != 2 {
+		t.Fatalf("want states 500 and drop_rate 2, got %v", data)
+	}
+}
+
+func TestSeriesProcWatch(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	s.Ingest(pfSnap(time.Now()))
+
+	labels, data := seriesOf(t, s, "/api/series?metric=procwatch&range=1h")
+	if len(labels) != 3 || labels[1] != "sshd" || labels[2] != "nginx" {
+		t.Fatalf("labels: want [ts sshd nginx], got %v", labels)
+	}
+	// A stopped service is a 0 in the series, not a gap — that is what makes
+	// "when did it die" answerable.
+	if data[1][0] != 1 || data[2][0] != 0 {
+		t.Fatalf("want sshd 1 and nginx 0, got %v", data)
+	}
+
+	// ?name= narrows to one watched process.
+	labels, _ = seriesOf(t, s, "/api/series?metric=procwatch&range=1h&name=nginx")
+	if len(labels) != 2 || labels[1] != "nginx" {
+		t.Fatalf("filtered labels: %v", labels)
+	}
+}
+
+// cores=0 drops the per-core columns for clients that render cores from the
+// live stream. On a big machine these dominate the payload, and band=1
+// triples them.
+func TestSeriesCoresOptOut(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	s.Ingest(pfSnap(time.Now()))
+
+	withCores, _ := seriesOf(t, s, "/api/series?metric=cpu&range=1h")
+	if len(withCores) != 9 { // ts + 4 modes + 4 cores
+		t.Fatalf("default should include per-core columns, got %v", withCores)
+	}
+	without, _ := seriesOf(t, s, "/api/series?metric=cpu&range=1h&cores=0")
+	if len(without) != 5 { // ts + 4 modes
+		t.Fatalf("cores=0 should drop them, got %v", without)
+	}
+	// Under band=1 each dropped column would have cost three.
+	banded, _ := seriesOf(t, s, "/api/series?metric=cpu&range=1h&band=1&cores=0")
+	if len(banded) != 13 { // ts + 4 modes x (value, min, max)
+		t.Fatalf("banded cores=0: got %v", banded)
+	}
+}
+
+func TestPrometheusNewSeries(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	snap := pfSnap(time.Now())
+	snap.ZFS = []collect.ZFSStats{
+		{Pool: "zroot", UsedPct: 70, Health: "DEGRADED", ScanAgeHours: 12, ScanKnown: true},
+		{Pool: "cold", UsedPct: 5, Health: "ONLINE"}, // never scrubbed
+	}
+	s.Ingest(snap)
+
+	body := get(s, "/metrics", nil).Body.String()
+	for _, want := range []string{
+		`beastie_net_errors{iface="em0",dir="rx"} 3`,
+		`beastie_net_drops{iface="em0",dir="tx"} 1`,
+		`beastie_proc_watch_count{name="nginx"} 0`,
+		`beastie_pf_states 500`,
+		`beastie_pf_state_percent 5`,
+		`beastie_pf_rate{kind="drop"} 2`,
+		// Health as an ordinal, so a Prometheus rule can alert on it.
+		`beastie_zfs_health{pool="zroot",state="DEGRADED"} 1`,
+		`beastie_zfs_scan_age_hours{pool="zroot"} 12`,
+		`beastie_zfs_dataset_bytes{dataset="zroot/var",kind="used"} 900`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("exposition missing %q", want)
+		}
+	}
+	// A pool that has never been scrubbed has no age; emitting 0 would read
+	// as "scrubbed just now".
+	if strings.Contains(body, `beastie_zfs_scan_age_hours{pool="cold"}`) {
+		t.Error("a never-scrubbed pool must not report a scan age")
+	}
+}

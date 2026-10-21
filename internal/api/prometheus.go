@@ -66,6 +66,18 @@ func writePrometheus(w io.Writer, snap collect.Snapshot) {
 			fmt.Fprintf(w, "beastie_net_bps{iface=\"%s\",dir=\"rx\"} %g\n", promLabel(n.Interface), n.RxBps)
 			fmt.Fprintf(w, "beastie_net_bps{iface=\"%s\",dir=\"tx\"} %g\n", promLabel(n.Interface), n.TxBps)
 		}
+		// Unlike the JSON, these are always emitted: a scrape target that
+		// drops a series when it is zero makes rate() and alerting awkward.
+		g("beastie_net_errors", "Network error rate in packets/sec.")
+		for _, n := range snap.Net {
+			fmt.Fprintf(w, "beastie_net_errors{iface=\"%s\",dir=\"rx\"} %g\n", promLabel(n.Interface), n.RxErr)
+			fmt.Fprintf(w, "beastie_net_errors{iface=\"%s\",dir=\"tx\"} %g\n", promLabel(n.Interface), n.TxErr)
+		}
+		g("beastie_net_drops", "Network drop rate in packets/sec (tx is always 0 on FreeBSD).")
+		for _, n := range snap.Net {
+			fmt.Fprintf(w, "beastie_net_drops{iface=\"%s\",dir=\"rx\"} %g\n", promLabel(n.Interface), n.RxDrop)
+			fmt.Fprintf(w, "beastie_net_drops{iface=\"%s\",dir=\"tx\"} %g\n", promLabel(n.Interface), n.TxDrop)
+		}
 	}
 
 	if len(snap.Disk) > 0 {
@@ -102,6 +114,53 @@ func writePrometheus(w io.Writer, snap collect.Snapshot) {
 		for _, z := range snap.ZFS {
 			fmt.Fprintf(w, "beastie_zfs_used_percent{pool=\"%s\"} %g\n", promLabel(z.Pool), z.UsedPct)
 		}
+		// Health as an ordinal so it can be alerted on numerically:
+		// 0 ONLINE, 1 DEGRADED, 2 anything worse. Mirrors the alert engine.
+		g("beastie_zfs_health", "ZFS pool health (0 online, 1 degraded, 2 worse).")
+		for _, z := range snap.ZFS {
+			fmt.Fprintf(w, "beastie_zfs_health{pool=\"%s\",state=\"%s\"} %g\n",
+				promLabel(z.Pool), promLabel(z.Health), promZFSHealth(z.Health))
+		}
+		g("beastie_zfs_scan_age_hours", "Hours since the pool's last completed scrub.")
+		for _, z := range snap.ZFS {
+			if !z.ScanKnown {
+				continue // never scrubbed: no age to report, and 0 would lie
+			}
+			fmt.Fprintf(w, "beastie_zfs_scan_age_hours{pool=\"%s\"} %g\n", promLabel(z.Pool), z.ScanAgeHours)
+		}
+	}
+
+	if len(snap.Datasets) > 0 {
+		g("beastie_zfs_dataset_bytes", "ZFS dataset space by kind.")
+		for _, d := range snap.Datasets {
+			fmt.Fprintf(w, "beastie_zfs_dataset_bytes{dataset=\"%s\",kind=\"used\"} %d\n", promLabel(d.Name), d.Used)
+			fmt.Fprintf(w, "beastie_zfs_dataset_bytes{dataset=\"%s\",kind=\"avail\"} %d\n", promLabel(d.Name), d.Avail)
+		}
+	}
+
+	if len(snap.Watch) > 0 {
+		g("beastie_proc_watch_count", "Running processes matching a watched name.")
+		for _, x := range snap.Watch {
+			fmt.Fprintf(w, "beastie_proc_watch_count{name=\"%s\"} %d\n", promLabel(x.Name), x.Count)
+		}
+	}
+
+	if pf := snap.PF; pf != nil {
+		g("beastie_pf_enabled", "Whether pf is enabled (1) or disabled (0).")
+		fmt.Fprintf(w, "beastie_pf_enabled %d\n", boolGauge(pf.Enabled))
+		g("beastie_pf_states", "Current pf state-table entries.")
+		fmt.Fprintf(w, "beastie_pf_states %d\n", pf.States)
+		if pf.StateLimit > 0 {
+			g("beastie_pf_state_limit", "pf state-table hard limit.")
+			fmt.Fprintf(w, "beastie_pf_state_limit %d\n", pf.StateLimit)
+			g("beastie_pf_state_percent", "pf state-table utilisation percentage.")
+			fmt.Fprintf(w, "beastie_pf_state_percent %g\n", pf.StatePct)
+		}
+		g("beastie_pf_rate", "pf counter rates per second.")
+		fmt.Fprintf(w, "beastie_pf_rate{kind=\"search\"} %g\n", pf.SearchRate)
+		fmt.Fprintf(w, "beastie_pf_rate{kind=\"insert\"} %g\n", pf.InsertRate)
+		fmt.Fprintf(w, "beastie_pf_rate{kind=\"match\"} %g\n", pf.MatchRate)
+		fmt.Fprintf(w, "beastie_pf_rate{kind=\"drop\"} %g\n", pf.DropRate)
 	}
 
 	if snap.ARC != nil {
@@ -117,6 +176,26 @@ func writePrometheus(w io.Writer, snap collect.Snapshot) {
 		for _, j := range snap.Jails {
 			fmt.Fprintf(w, "beastie_jail_procs{jid=\"%d\",name=\"%s\"} %d\n", j.JID, promLabel(j.Name), j.Procs)
 		}
+	}
+}
+
+func boolGauge(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// promZFSHealth grades pool health the same way alert.zfsHealthOrdinal does,
+// so a Prometheus rule and a [[alerts.rule]] agree on what "1" means.
+func promZFSHealth(health string) float64 {
+	switch strings.ToUpper(strings.TrimSpace(health)) {
+	case "ONLINE", "":
+		return 0
+	case "DEGRADED":
+		return 1
+	default:
+		return 2
 	}
 }
 

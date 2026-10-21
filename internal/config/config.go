@@ -84,7 +84,7 @@ type AlertRule struct {
 	Name      string   `toml:"name"`
 	Metric    string   `toml:"metric"`    // cpu|mem|swap|load|fs|temp|disk|net
 	Field     string   `toml:"field"`     // metric-specific, e.g. total, used_pct, load1, max
-	Op        string   `toml:"op"`        // > | >= | < | <=
+	Op        string   `toml:"op"`        // > | >= | < | <= | ==
 	Threshold float64  `toml:"threshold"` // comparison value
 	For       Duration `toml:"for"`       // sustain Duration before firing (default 0)
 	Webhook   string   `toml:"webhook"`   // per-rule override of AlertsConfig.Webhook
@@ -110,10 +110,23 @@ type CollectConfig struct {
 	NetExclude []string `toml:"net_exclude"`
 	RingSize   int      `toml:"ring_size"`
 	TopProcs   int      `toml:"top_procs"`
-	// ZFS and Jails are off by default: each shells out to zpool/jls/ps every
-	// tick, so they only run where the host actually uses those features.
+	// ZFS, Jails and PF are off by default: each shells out to
+	// zpool/jls/ps/pfctl every tick, so they only run where the host
+	// actually uses those features.
 	ZFS   bool `toml:"zfs"`
 	Jails bool `toml:"jails"`
+	PF    bool `toml:"pf"`
+
+	// ZFSDatasets caps how many datasets (largest first) ride each snapshot
+	// when ZFS is on. 0 (default) collects none: a host with jails can have
+	// hundreds, and they would all be in every SSE frame.
+	ZFSDatasets int `toml:"zfs_datasets"`
+
+	// ProcWatch names processes to count every tick, so a rule can alert on
+	// one being absent. Empty (default) costs nothing; a non-empty list
+	// makes the collector look up a name for every process rather than only
+	// the top-N it reports.
+	ProcWatch []string `toml:"proc_watch"`
 }
 
 // Duration wraps time.Duration for TOML unmarshaling.
@@ -175,6 +188,11 @@ func (c *Config) normalize() {
 	}
 	if c.Collect.TopProcs <= 0 {
 		c.Collect.TopProcs = def.Collect.TopProcs
+	}
+	// Unlike the others, 0 is meaningful here (collect no datasets), so only
+	// a negative value is nonsense.
+	if c.Collect.ZFSDatasets < 0 {
+		c.Collect.ZFSDatasets = 0
 	}
 	if c.Store.Retention.Duration <= 0 {
 		c.Store.Retention = def.Store.Retention

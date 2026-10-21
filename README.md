@@ -224,10 +224,20 @@ net_exclude = ["lo0"]
 # The kernel "idle" process is always excluded.
 top_procs = 5
 
-# FreeBSD-only extra panels, off by default. Each shells out (zpool / jls / ps)
-# every tick, so enable only where the host uses them.
+# FreeBSD-only extra panels, off by default. Each shells out (zpool / jls / ps
+# / pfctl) every tick, so enable only where the host uses them.
 zfs   = false
 jails = false
+pf    = false
+
+# With zfs = true, also report the N largest datasets. 0 collects none: a host
+# with jails can have hundreds, and they would all ride every snapshot.
+zfs_datasets = 0
+
+# Count these processes every tick so a rule can fire when one stops. Empty
+# costs nothing; a non-empty list makes the collector resolve a name for every
+# process rather than only the top-N it reports.
+proc_watch = []
 
 [auth]
 # Optional HTTP authentication. Disabled by default (all fields empty).
@@ -270,13 +280,14 @@ format  = ""          # default payload format: "" / "raw" (alert JSON), "slack"
 # Resolves on the next sample. "0s" (default) disables it.
 stale_after = "0s"    # e.g. "30s"
 
-# Array metrics (fs, temp, disk, net) use `field` as a selector: an exact
-# name/mount, or "max" (default) for the worst-case value.
+# Array metrics (fs, temp, jail, proc) use `field` as a selector: an exact
+# name/mount, or "max" (default) for the worst-case value. zfs reduces to the
+# worst case across pools.
 # [[alerts.rule]]
 # name       = "cpu-sustained"
 # metric     = "cpu"    # cpu|mem|swap|load|fs|temp|disk|net
 # field      = "total"  # metric-specific: total, used_pct, load1, max, ...
-# op         = ">"      # > | >= | < | <=
+# op         = ">"      # > | >= | < | <= | ==
 # threshold  = 90
 # for        = "30s"    # sustain duration before firing (default 0 = immediate)
 # repeat     = "5m"     # re-notify every 5m while still firing (default 0 = notify once)
@@ -315,6 +326,66 @@ The default (`raw`) posts the alert as JSON:
 {"rule":"cpu-sustained","metric":"cpu","field":"total","op":">","threshold":90,
  "value":95.2,"state":"firing","ts":"2026-07-16T10:00:00Z"}
 ```
+
+**Metrics and fields.** A rule names one metric and one field:
+
+| Metric | Fields |
+|--------|--------|
+| `cpu`  | `total` `user` `sys` `idle` |
+| `mem`  | `used_pct` `used` `free` |
+| `swap` | `pct` `used` |
+| `load` | `load1` `load5` `load15` |
+| `fs`   | a mount point, or `max` (default) |
+| `temp` | a sensor name, or `max` (default) |
+| `disk` | `read_bps` `write_bps` `read_iops` `write_iops` `total_bps` `total_iops` |
+| `net`  | `rx_bps` `tx_bps` `rx_pps` `tx_pps` `total_bps` `rx_err` `tx_err` `err` `rx_drop` `tx_drop` `drop` |
+| `zfs`  | `used_pct` `health` `scan_pct` `scan_age_hours` — worst case across pools |
+| `arc`  | `hit_rate` `size` `target` |
+| `jail` | `count`, or a jail name (that jail's process count) |
+| `proc` | a name from `[collect] proc_watch` (its running count) |
+| `pf`   | `state_pct` `states` `drop_rate` `match_rate` `search_rate` `insert_rate` |
+
+`zfs.health` is graded numerically so the ordinary comparator can alert on it
+without a string-matching rule language: **0** `ONLINE`, **1** `DEGRADED`,
+**2** anything worse (`FAULTED`, `UNAVAIL`, `REMOVED`, `OFFLINE`). So
+`op = ">=", threshold = 1` catches any departure from healthy — arguably the
+single most valuable rule on a ZFS host, and one that previously had no way
+to exist even though the dashboard already showed the pool state.
+
+```toml
+# A pool leaving ONLINE.
+[[alerts.rule]]
+name = "pool-unhealthy"
+metric = "zfs"
+field = "health"
+op = ">="
+threshold = 1
+
+# A service that stopped. Needs "sshd" in [collect] proc_watch —
+# `beastied -t` warns when a rule watches a process nothing counts.
+[[alerts.rule]]
+name = "sshd-down"
+metric = "proc"
+field = "sshd"
+op = "<"
+threshold = 1
+for = "30s"
+
+# Scrub overdue (35 days, covering a monthly schedule with slack).
+[[alerts.rule]]
+name = "scrub-overdue"
+metric = "zfs"
+field = "scan_age_hours"
+op = ">"
+threshold = 840
+```
+
+A metric whose subsystem isn't enabled — `zfs` without `[collect] zfs`, `proc`
+without the name in `proc_watch` — reads `unknown` rather than `0`, so a rule
+that cannot see its data is visibly broken instead of permanently green.
+`scan_age_hours` likewise ignores pools that have never been scrubbed: zero
+would read as "scrubbed just now", the opposite of the truth, so those surface
+as `unknown` (and the dashboard flags them separately as *never scrubbed*).
 
 Alert activity is also visible without a webhook: `GET /api/alerts` reports
 each rule's live state (`ok` / `pending` / `firing` / `unknown`, with the
@@ -364,6 +435,17 @@ service beastied stop
 service beastied restart
 service beastied status
 service beastied reload    # SIGHUP: hot-reload config (see Configuration)
+```
+
+**Check the config before reloading.** `beastied -t` loads the file, reports
+anything that would misbehave, and exits `0` or `1` without starting
+anything — the same warnings startup logs, except a rule typo found at startup
+has already taken the reload with it:
+
+```sh
+$ beastied -t && service beastied reload
+/usr/local/etc/beastiemon.conf: syntax ok (auth on, store on, 4 alert rule(s))
+beastied: configuration reloaded
 ```
 
 Log:
@@ -444,10 +526,20 @@ printed last. `beastie proc` shows just the process table.
 | `beastie temp`    | Temperature sensors |
 | `beastie proc`    | Top-N processes by CPU |
 | `beastie load`    | Load average |
+| `beastie zfs`     | ZFS pools, scrub state, datasets, ARC |
+| `beastie jail`    | Running jails |
+| `beastie pf`      | pf state table and counters |
+| `beastie watch`   | Watched processes (`proc_watch`) |
 | `beastie top`     | Continuous refresh — like `top(1)`, Ctrl-C to quit |
 | `beastie check`   | Nagios-style threshold check (see below) |
+| `beastie alerts`  | Rule states from a running daemon (needs `--remote`) |
 | `beastie version` | Print version and exit |
 | `beastie help`    | Usage |
+
+`zfs`, `jail`, `pf` and `watch` need the matching `[collect]` switch; without
+it they say so rather than printing nothing. The full `status` view shows each
+of them only when it produced something, so a host that uses none of them
+looks exactly as it did before.
 
 ### Monitoring check mode
 
@@ -465,12 +557,57 @@ WARNING: mem.used% = 78.40 | value=78.40;70;85   # exit 1
 
 Metrics: `cpu` (total%), `mem` (used%), `swap` (used%), `load` (load1),
 `fs` (worst mount used%), `temp` (hottest sensor °C), `net` (total rx+tx
-bytes/s across interfaces), `disk` (total read+write bytes/s across devices).
+bytes/s across interfaces), `disk` (total read+write bytes/s across devices),
+`zfs` (worst pool used%), `arc` (hit%), `jail` (running jails), `pf` (state
+table %), `proc` (needs `--field`).
+
+**`--field` selects within a metric**, using the same names a
+[[alerts.rule]](#alerting) takes — one metric table serves both, so a check
+and a rule written the same way cannot disagree about what they measure. That
+makes one Nagios service per filesystem possible, instead of only the
+worst-case roll-up:
+
+```sh
+beastie check --warn 80 --crit 90 --field /var fs    # one service per mount
+beastie check --field cpu0 temp                      # one named sensor
+beastie check --crit 1 --field health zfs            # pool health ordinal
+```
+
+**`--below` flips the comparison** for the metrics where small is bad. The two
+directions are exact complements (`value >= threshold` and `value < threshold`),
+so it reads as "critical below 1":
+
+```sh
+$ beastie check --crit 1 --below --field sshd proc   # needs proc_watch = ["sshd"]
+CRITICAL: proc.sshd = 0.00 | value=0.00;0;1          # exit 2
+```
+
+A field the metric doesn't have is reported as a typo, separately from a field
+that exists but has nothing behind it — different problems with different
+fixes:
+
+```sh
+$ beastie check --field totl cpu
+UNKNOWN: metric "cpu" has no field "totl"            # exit 3
+$ beastie check --field /var fs                      # /var isn't mounted
+UNKNOWN: fs./var has no readings (nothing to measure)  # exit 3
+```
+
 Thresholds are optional; omit both for an informational `OK` with the current
 value. Flags precede the metric. A failed collection — local sampling timed
 out, or the `--remote` daemon is unreachable — reports `UNKNOWN` (exit 3)
-rather than a false `OK: … = 0.00`. Combine with `--remote` for instant
-checks against the running daemon.
+rather than a false `OK: … = 0.00`. So does an array metric with nothing to
+read at all: no temperature sensors (the `coretemp`/`amdtemp` module isn't
+loaded), no mount matching `fs_include`, no interfaces. Those have no value to
+compare against, and a green `OK: temp.max_c = 0.00` would be worse than no
+check at all:
+
+```sh
+$ beastie check --warn 60 --crit 80 temp        # sensors never loaded
+UNKNOWN: temp.max_c has no readings (nothing to measure)   # exit 3
+```
+
+Combine with `--remote` for instant checks against the running daemon.
 
 ### Remote mode
 
@@ -499,6 +636,9 @@ config's `[auth]` section: the bearer `token` if set, else basic
 --remote <addr>  Read from a running beastied: "auto", host:port, URL, or socket path
 ```
 
+`check` takes its own flags after the subcommand: `--warn N`, `--crit N`,
+`--field F`, `--below`.
+
 Flags must come before the command (`beastie --json cpu`, not `beastie cpu --json`).
 Colour and the banner are emitted only when stdout is a terminal; piping to a
 file or `less`, or setting the `NO_COLOR` environment variable, yields clean
@@ -509,6 +649,25 @@ and the full status output display. The kernel `idle` process is excluded: it
 accrues a core-second per core per second by definition, so it would sit at the
 top of every list without ever telling you anything — the same reason `top(1)`
 hides idle threads unless you ask for them.
+
+### Checking alerts from the shell
+
+`beastie alerts` renders the daemon's `/api/alerts` — rule states and recent
+events — so triage from an ssh session needs neither a browser nor `curl | jq`.
+The alert engine lives in the daemon, so this one requires `--remote`:
+
+```sh
+$ beastie --remote auto alerts
+ALERT   sshd-down            firing   proc.sshd < 1            0.00
+ALERT   pool-unhealthy       ok       zfs.health >= 1          0.00
+ALERT   watchdog             ok       sampler.age_seconds > 30 0.53
+
+Recent events:
+        2026-10-21 22:44:49  firing   sshd-down
+```
+
+It exits `0` when nothing is firing and `2` when something is, following the
+check-mode convention, so it also works as a single "is anything wrong" probe.
 
 ### JSON output
 
@@ -542,8 +701,10 @@ for charts.
 - **CPU** — area chart of user / sys / idle plus a total line. On wide ranges
   backed by `[store]`, a shaded min/max band around the total line shows the
   intra-bucket spikes that roll-up averaging would otherwise smooth away.
-  (Per-core values are collected and exposed via the CLI and `/api/series`,
-  but the web card plots the aggregate only.)
+  Below the chart, a strip of per-core bars shows the current distribution —
+  deliberately live-only, because what it answers ("is one core pinned while
+  the rest idle?") is a question about right now, and fetching per-core
+  *history* would cost a column per core on every range change.
 - **Load** — 1 / 5 / 15-minute lines, with current values.
 - **Memory** — used / free / swap stacked area, in bytes.
 - **Network** — RX / TX, sums all NICs by default; per-iface tabs appear
@@ -552,18 +713,35 @@ for charts.
 - **Temperatures** — bar gauges, colour-coded (green / orange / red).
 - **Filesystems** — usage progress bars per mount.
 - **Top Processes** — live-updating table of `top_procs` processes by
-  CPU%, with PID, name, CPU%, MEM%, RSS.
+  CPU%, with PID, name, CPU%, MEM%, RSS. Any `proc_watch` names are listed
+  underneath with a running / NOT RUNNING state, since an idle service never
+  ranks in the top-N and so can't be told apart from a stopped one there.
 - **Alerts** — rule table (name, condition, ok/pending/firing/unknown badge,
   current value — the sampler watchdog included) plus the most recent events. Hidden
   until `[alerts]` rules or `stale_after` are configured; refreshes every 10 s.
-- **ZFS** — per-pool usage bars plus an ARC size / hit-rate summary. Hidden
+- **ZFS** — per-pool usage bars plus an ARC size / hit-rate summary, the pool
+  health, and the scrub state: a scrub in progress with its percentage, or how
+  long ago the last one finished (flagged past 35 days), or *never scrubbed*.
+  With `zfs_datasets` set, the largest datasets are listed underneath. Hidden
   unless `[collect] zfs = true` and pools exist.
 - **Jails** — table of running jails (JID, name, hostname, process count).
   Hidden unless `[collect] jails = true` and jails are running.
+- **pf** — state-table utilisation against the hard limit, plus match, search,
+  insert and drop rates. The drop figure counts only the `memory`,
+  `state-limit` and `congestion` counters — traffic pf discarded for want of
+  resources rather than by a rule — so anything above zero is a real incident.
+  Hidden unless `[collect] pf = true` and `/dev/pf` is readable.
 
 The range selector (5 m / 15 m / 1 h / 6 h / 24 h) re-fetches historical
 data; live updates flow over SSE and are appended to the existing series
 in-place.
+
+**Freeze** (the ⏸ button, or the space bar) holds the whole view still so a
+spike can be read instead of scrolling away; resuming re-seeds from history so
+the frozen gap fills in rather than leaving a flat line. Each chart card has a
+**⤓** button that downloads what it currently shows as CSV — so whatever you
+froze and were looking at is what lands in the file, ready to hand to someone
+else.
 
 > **Note:** without `[store]`, ranges longer than the configured `ring_size`
 > return only what the in-memory buffer holds. Enable `[store]` to serve long
@@ -614,13 +792,23 @@ Returns uPlot-shaped data:
 }
 ```
 
-Supported metrics: `cpu`, `mem`, `load`, `net`, `disk`, `temp`, `fs`, `proc`,
-`zfs`, `arc`, `jail`. Optional filters: `iface=em0` (`net`), `dev=ada0`
-(`disk`), `mount=/` (`fs`), `pid=845` (`proc`), `pool=zroot` (`zfs`), `jid=3`
-(`jail`). `fs` returns one used-% series per mount and `zfs` one per pool;
-`proc` returns one CPU-% series per process in the latest sample and `jail`
-one process-count series per jail; `arc` returns `size`/`target` (bytes) and
-`hit_rate` (%) columns.
+Supported metrics: `cpu`, `mem`, `load`, `net`, `neterr`, `disk`, `temp`, `fs`,
+`proc`, `procwatch`, `zfs`, `arc`, `jail`, `pf`. Optional filters: `iface=em0`
+(`net`, `neterr`), `dev=ada0` (`disk`), `mount=/` (`fs`), `pid=845` (`proc`),
+`pool=zroot` (`zfs`), `jid=3` (`jail`), `name=sshd` (`procwatch`). `fs` returns
+one used-% series per mount and `zfs` one per pool; `proc` returns one CPU-%
+series per process in the latest sample, `jail` one process-count series per
+jail, and `procwatch` one running-count series per watched name (so "when did
+sshd stop" has an answer, not just a current state); `arc` returns
+`size`/`target` (bytes) and `hit_rate` (%) columns; `neterr` returns
+`rx_err`/`tx_err`/`rx_drop`/`tx_drop`, charted apart from throughput because
+they share no useful axis with bytes/sec; `pf` returns `states`, `state_pct`,
+`match_rate` and `drop_rate`.
+
+`metric=cpu` includes one column per core by default. Add **`cores=0`** to drop
+them: they dominate the payload on a large machine, and `band=1` triples the
+cost. On a 16-core host that is 61 columns down to 13. The dashboard passes it,
+rendering per-core from the live stream instead.
 `range` accepts Go durations (`5m`, `1h`, `24h`) or seconds as a plain int.
 When `[store]` is configured, ranges beyond `ring_size` are served from the
 SQLite history — rolled up to one averaged sample per `resolution` (one per
@@ -689,8 +877,18 @@ websocat ws://127.0.0.1:8088/api/ws
 Latest snapshot in Prometheus text exposition format, so BeastieMon can be a
 scrape target — `beastie_cpu_percent`, `beastie_mem_used_percent`,
 `beastie_fs_used_percent{mount="/"}`, `beastie_load{period="1"}`, and so on
-(including ZFS/ARC/jail series when enabled). `503` until the first sample.
+(including ZFS/ARC/jail/pf series when enabled). `503` until the first sample.
 When `[auth]` is on, scrapers pass the bearer token like any other endpoint.
+
+Also exported: `beastie_net_errors{iface,dir}` and `beastie_net_drops{iface,dir}`
+(always emitted, even at zero — a series that disappears when healthy makes
+`rate()` and alerting awkward), `beastie_proc_watch_count{name}`,
+`beastie_pf_states` / `beastie_pf_state_percent` / `beastie_pf_rate{kind}`,
+`beastie_zfs_health{pool,state}` (the same 0/1/2 ordinal the alert engine
+uses, so a Prometheus rule and a `[[alerts.rule]]` agree on what `1` means),
+`beastie_zfs_scan_age_hours{pool}` (omitted for a pool that has never been
+scrubbed, since `0` would read as "scrubbed just now"), and
+`beastie_zfs_dataset_bytes{dataset,kind}`.
 
 ```yaml
 # prometheus.yml
@@ -851,6 +1049,47 @@ You're running an older version of the rc.d script that uses
 update `/usr/local/etc/rc.d/beastied` from the current source. See
 DESIGN.md §13 for the `rc.subr` magic-variable explanation.
 
+### pf panel never appears
+
+`pfctl` reads `/dev/pf`, which is `root`-only on a stock FreeBSD install,
+while the daemon runs as `_beastie`. The collector degrades quietly (the card
+stays hidden, `beastie pf` says so) rather than filling the log. Grant access
+with a devfs rule:
+
+```sh
+# /etc/devfs.rules
+[beastiemon=10]
+add path 'pf' mode 0640 group _beastie
+```
+
+```sh
+sysrc devfs_system_ruleset=beastiemon
+service devfs restart
+service beastied restart
+```
+
+Check it took with `su -m _beastie -c 'pfctl -si'`. If pf itself is disabled,
+the card shows **disabled** rather than hiding — that is a different problem.
+
+### A rule stays "unknown" forever
+
+The metric can't be read: a mount that isn't mounted, a host with no
+temperature sensors, `metric = "zfs"` without `[collect] zfs = true`, or a
+`proc` rule naming something that isn't in `[collect] proc_watch`. Run
+`beastied -t` — it reports rule typos *and* the proc_watch mismatch, which
+spans two config sections and so can't be caught by looking at `[alerts]`
+alone:
+
+```sh
+$ beastied -t
+beastiemon.conf: warning: alert rule "sshd-down": watches process "sshd", but
+  it is not in [collect] proc_watch — it will never fire
+beastiemon.conf: configuration has 1 problem(s)
+```
+
+This is deliberately *not* a silent green: a rule that cannot see its data is
+worse than no rule, because it looks like everything is fine.
+
 ### Browser shows red "live" dot
 
 SSE connection dropped. The page auto-reconnects every 5 s. If it
@@ -919,8 +1158,14 @@ gmake build-native
 
 Disk, network, filesystem, CPU, memory, and process metrics use
 `gopsutil` and work fine on Linux — as do the store, alerts, and every
-HTTP surface; the temperature, ZFS, and jail panels stay empty (their
-collectors are FreeBSD-only stubs).
+HTTP surface; the temperature, ZFS, jail, and pf panels stay empty (their
+collectors are FreeBSD-only stubs). `proc_watch` works everywhere, so the
+service-down rule can be exercised on Linux.
+
+Each FreeBSD-only collector is split so its *parsing* has no build tag and is
+unit-tested on any host: `bsdextra_parse.go` (`zpool list`, `zpool status`,
+`zfs list`, `jls`, `ps`) and `pf_parse.go` (`pfctl`). Only the `exec`/`sysctl`
+wrappers are gated.
 
 ### Code style
 
@@ -944,29 +1189,52 @@ daemon, no FreeBSD host, no external framework. The suites:
   `/healthz`, and `Server.Close` unblocking a live SSE stream. Uses
   `httptest` and an in-memory `fstest.MapFS`.
 - [`internal/api/features_test.go`](internal/api/features_test.go) — the
-  Prometheus `/metrics` exposition, `/api/series` shaping (`fs`, `proc`,
-  `zfs`, `arc`, `jail`, and `band=1`), `/api/alerts`, and the WebSocket
-  stream.
+  Prometheus `/metrics` exposition (including the net error/drop, pf,
+  proc-watch, dataset and ZFS health/scan series), `/api/series` shaping
+  (`fs`, `proc`, `procwatch`, `zfs`, `arc`, `jail`, `neterr`, `pf`, `band=1`,
+  and the `cores=0` opt-out), `/api/alerts`, and the WebSocket stream.
 - [`internal/alert/alert_test.go`](internal/alert/alert_test.go) — the
   threshold engine: sustained firing/resolve, immediate fire on `for = 0`,
-  the `fs` "max" selector, the webhook POST payload, re-notify/hysteresis,
-  rule states (`ok`/`pending`/`firing`), the capped event history + sink,
-  and the `stale_after` sampler watchdog.
+  the `fs` "max" selector, the webhook POST payload (raw/Slack/Discord),
+  re-notify/hysteresis, rule states (`ok`/`pending`/`firing`/`unknown`), the
+  capped event history + sink, the `stale_after` sampler watchdog, and
+  `Validate`'s rule-typo warnings staying in step with `metricValue`.
+- [`internal/alert/metrics_test.go`](internal/alert/metrics_test.go) — the
+  metric table: the zfs/arc/jail/proc/pf fields, the ZFS health ordinal, a
+  pool-degraded rule firing and resolving, a service-down rule firing on a
+  `proc_watch` count of zero, and every new metric reading `unknown` (not a
+  green zero) when its subsystem isn't present.
 - [`internal/store/sqlite_test.go`](internal/store/sqlite_test.go) — the
   SQLite history: persist-and-query, downsampling to `resolution`, retention
   pruning, async writes, coarse-tier re-aggregation (merge, idempotence,
-  recent rows untouched), and alert-event persistence.
+  recent rows untouched, and a bucket wider than one coarsen batch left
+  alone), alert-event persistence, and the roll-up carrying the newer fields
+  (error/drop envelopes averaged; pf's enabled flag and hard limit, and ZFS
+  health/scan state, carried rather than averaged).
 - [`internal/collect/bsdextra_parse_test.go`](internal/collect/bsdextra_parse_test.go)
   — the pure `zpool` / kstat / `jls` / `ps` parsers (split out precisely so
-  they test on any OS, not just FreeBSD) — plus the counter-reset clamp in
-  [`delta_test.go`](internal/collect/delta_test.go).
+  they test on any OS, not just FreeBSD) — plus the counter-reset clamp and
+  the width-independent rate rounding in
+  [`delta_test.go`](internal/collect/delta_test.go), the stable `net[]` /
+  `disk[]` ordering in [`order_test.go`](internal/collect/order_test.go), the
+  `pfctl -si` / `-sm` parsers in
+  [`pf_parse_test.go`](internal/collect/pf_parse_test.go), and the
+  `zpool status` scan states (finished, in progress, never scrubbed, clock
+  skew) plus `zfs list` capping in
+  [`zfsextra_test.go`](internal/collect/zfsextra_test.go).
 - [`internal/config/config_test.go`](internal/config/config_test.go) — loader
   defaults, clamping of nonsensical values (`interval = "0s"`,
   `ring_size = 0`), and the coarse-tier / watchdog knobs.
 - [`cmd/beastie/main_test.go`](cmd/beastie/main_test.go) — the colour/TTY
-  guard, `check`-mode threshold evaluation (incl. `net`/`disk`), the
-  interval-scaled collection timeout, and remote mode (target parsing plus a
-  live `httptest` fetch with bearer auth).
+  guard, `check`-mode threshold evaluation (incl. `net`/`disk`, `--below`,
+  `--field` selectors, and the "nothing to measure" UNKNOWN kept distinct
+  from a field typo), the progress-bar clamp, the interval-scaled collection
+  timeout, the `top` repaint cadence, `check` offering exactly the metrics
+  the alert engine knows, and remote mode (target parsing plus a live
+  `httptest` fetch with bearer auth).
+- [`cmd/beastied/main_test.go`](cmd/beastied/main_test.go) — `beastied -t`:
+  its exit codes, and the cross-section check that a `proc` rule names
+  something `[collect] proc_watch` actually counts.
 
 ### Contributing
 

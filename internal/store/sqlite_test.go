@@ -220,3 +220,109 @@ func TestAlertEventsRoundTrip(t *testing.T) {
 		t.Fatalf("default limit should return all 3, got %d", len(got))
 	}
 }
+
+// A coarse bucket holding more fine rows than one coarsen batch used to be
+// folded piecewise: each batch wrote a partial aggregate at the bucket
+// timestamp and the following INSERT OR REPLACE discarded it, so the surviving
+// row covered only the final slice. The bucket is now left at fine resolution
+// instead, and maintain still makes forward progress past it.
+func TestCoarsenSkipsBucketWiderThanOneBatch(t *testing.T) {
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "history.db"), Options{
+		Retention:        100 * 24 * time.Hour,
+		Resolution:       time.Second,
+		CoarseAfter:      24 * time.Hour,
+		CoarseResolution: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	<-db.ready
+	db.batchSize = 4 // a bucket of 6 rows now exceeds one batch
+
+	// Six one-second rows inside a single hourly bucket, then two rows in the
+	// next hour that must still be reachable after the oversized one.
+	base := time.Now().Add(-48 * time.Hour).Truncate(time.Hour)
+	for i := 0; i < 6; i++ {
+		db.ingest(snapAt(base.Add(time.Duration(i)*time.Second), float64(10*i)))
+	}
+	next := base.Add(time.Hour)
+	db.ingest(snapAt(next, 1))
+	db.ingest(snapAt(next.Add(time.Second), 3))
+	db.flush()
+	if n := len(db.Since(base.Add(-time.Hour))); n != 8 {
+		t.Fatalf("precondition: want 8 fine rows, got %d", n)
+	}
+
+	db.maintain() // must terminate, not loop on the oversized bucket
+
+	got := db.Since(base.Add(-time.Hour))
+	// 6 untouched fine rows + the following bucket merged into 1.
+	if len(got) != 7 {
+		t.Fatalf("want 6 untouched rows + 1 merged bucket, got %d", len(got))
+	}
+	for i := 0; i < 6; i++ {
+		if got[i].CPU.Total != float64(10*i) {
+			t.Fatalf("row %d was rewritten: got %v, want %v", i, got[i].CPU.Total, 10*i)
+		}
+	}
+	// The bucket after the oversized one was still reached and coarsened.
+	if !got[6].Time.Equal(next) || got[6].CPU.Total != 2 {
+		t.Fatalf("following bucket: want ts=%v avg=2, got ts=%v avg=%v",
+			next, got[6].Time, got[6].CPU.Total)
+	}
+
+	// Idempotent: a second pass changes nothing.
+	db.maintain()
+	if n := len(db.Since(base.Add(-time.Hour))); n != 7 {
+		t.Fatalf("second maintain changed row count: %d", n)
+	}
+}
+
+// The rollup has to carry the fields added alongside throughput: the error
+// and drop rates average like any other rate, while pf's enabled flag and
+// hard limit are configuration that must survive rather than be averaged.
+func TestRollupCarriesNewFields(t *testing.T) {
+	db := openTestDB(t, time.Hour, time.Minute)
+	base := time.Now().Truncate(time.Minute)
+
+	mk := func(off time.Duration, rxErr, drop float64, states uint64) collect.Snapshot {
+		s := snapAt(base.Add(off), 10)
+		s.Net = []collect.NetStats{{Interface: "em0", RxBps: 100, RxErr: rxErr}}
+		s.PF = &collect.PFStats{Enabled: true, States: states, StateLimit: 10000, DropRate: drop}
+		s.Watch = []collect.ProcWatch{{Name: "sshd", Count: 1}}
+		s.ZFS = []collect.ZFSStats{{Pool: "zroot", UsedPct: 50, Health: "DEGRADED",
+			Scan: "scrub_done", ScanAgeHours: 12, ScanKnown: true}}
+		return s
+	}
+	db.ingest(mk(0, 2, 0, 100))
+	db.ingest(mk(10*time.Second, 4, 6, 300))
+	db.flush()
+
+	avg, lo, hi := db.RollupSince(base.Add(-time.Hour))
+	if len(avg) != 1 {
+		t.Fatalf("want one bucket, got %d", len(avg))
+	}
+	if avg[0].Net[0].RxErr != 3 || lo[0].Net[0].RxErr != 2 || hi[0].Net[0].RxErr != 4 {
+		t.Errorf("net error envelope: avg=%v min=%v max=%v",
+			avg[0].Net[0].RxErr, lo[0].Net[0].RxErr, hi[0].Net[0].RxErr)
+	}
+	if avg[0].PF == nil || avg[0].PF.States != 200 || avg[0].PF.DropRate != 3 {
+		t.Errorf("pf rollup: %+v", avg[0].PF)
+	}
+	// Not measurements, so they are carried rather than averaged.
+	if !avg[0].PF.Enabled || avg[0].PF.StateLimit != 10000 {
+		t.Errorf("pf config fields should survive the rollup: %+v", avg[0].PF)
+	}
+	if hi[0].PF.States != 300 {
+		t.Errorf("pf max states = %d, want 300", hi[0].PF.States)
+	}
+	// Strings and flags come from the last sample in the bucket.
+	if avg[0].ZFS[0].Health != "DEGRADED" || avg[0].ZFS[0].Scan != "scrub_done" ||
+		!avg[0].ZFS[0].ScanKnown || avg[0].ZFS[0].ScanAgeHours != 12 {
+		t.Errorf("zfs scan state lost in rollup: %+v", avg[0].ZFS[0])
+	}
+	if len(avg[0].Watch) != 1 || avg[0].Watch[0].Name != "sshd" {
+		t.Errorf("watch list lost in rollup: %+v", avg[0].Watch)
+	}
+}

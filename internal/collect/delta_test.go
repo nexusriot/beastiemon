@@ -19,3 +19,31 @@ func TestDeltaU64(t *testing.T) {
 		}
 	}
 }
+
+// round2 used to go through `int`, which is 32 bits on the 386/arm FreeBSD
+// targets the Makefile can build. Any throughput past ~21 MB/s overflowed the
+// conversion there and came back as a large negative number, which then flowed
+// into /api/metrics, the Prometheus exporter, stored rollups, and net/disk
+// alert thresholds. Guard the ranges a saturated link actually produces.
+func TestRound2HandlesLargeAndNegativeValues(t *testing.T) {
+	cases := []struct {
+		name string
+		in   float64
+		want float64
+	}{
+		{"small", 42.126, 42.13},
+		{"half rounds up", 0.005, 0.01},
+		{"100 Mbit/s in bytes", 12_500_000, 12_500_000},
+		{"1 Gbit/s in bytes", 125_000_000, 125_000_000},
+		{"10 Gbit/s in bytes", 1_250_000_000, 1_250_000_000},
+		{"packets per second", 1_488_095, 1_488_095},
+		{"negative rounds away from zero", -0.005, -0.01},
+		{"negative large", -125_000_000, -125_000_000},
+		{"zero", 0, 0},
+	}
+	for _, c := range cases {
+		if got := round2(c.in); got != c.want {
+			t.Errorf("%s: round2(%v) = %v, want %v", c.name, c.in, got, c.want)
+		}
+	}
+}

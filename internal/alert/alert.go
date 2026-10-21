@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -400,9 +401,30 @@ func compare(v float64, op string, thr float64) bool {
 	return false
 }
 
+// zfsHealthOrdinal grades a pool's health string so the ordinary numeric
+// comparator can alert on it, rather than this needing a string-matching rule
+// language (DESIGN.md §1: no complex rule engine). ONLINE is 0, DEGRADED is 1,
+// and everything that means "this pool is not serving data properly" is 2, so
+// `op = ">=", threshold = 1` catches any departure from healthy.
+func zfsHealthOrdinal(health string) float64 {
+	switch strings.ToUpper(strings.TrimSpace(health)) {
+	case "ONLINE":
+		return 0
+	case "DEGRADED":
+		return 1
+	case "":
+		// zpool list reported no health column; don't invent a verdict.
+		return 0
+	default: // FAULTED, OFFLINE, UNAVAIL, REMOVED, …
+		return 2
+	}
+}
+
 // metricValue extracts the scalar a rule watches. Array metrics (fs, temp)
 // use field as an exact selector or "max"/"" for the worst-case value; disk
-// and net sum the chosen component across devices/interfaces.
+// and net sum the chosen component across devices/interfaces; zfs reduces to
+// the worst case across pools, because "is any pool unhealthy" is the
+// question an operator actually has.
 func metricValue(snap collect.Snapshot, metric, field string) (float64, bool) {
 	switch metric {
 	case "cpu":
@@ -469,8 +491,101 @@ func metricValue(snap collect.Snapshot, metric, field string) (float64, bool) {
 			sum += get(n)
 		}
 		return sum, true
+	case "zfs":
+		return zfsValue(snap, field)
+	case "arc":
+		if snap.ARC == nil {
+			return 0, false
+		}
+		switch field {
+		case "", "hit_rate":
+			return snap.ARC.HitRate, true
+		case "size":
+			return float64(snap.ARC.Size), true
+		case "target":
+			return float64(snap.ARC.Target), true
+		}
+	case "jail":
+		switch field {
+		case "", "count":
+			// Always readable: zero running jails is a fact, not a gap, and
+			// is exactly what a "my jails died" rule needs to see.
+			return float64(len(snap.Jails)), true
+		}
+		for _, j := range snap.Jails {
+			if j.Name == field {
+				return float64(j.Procs), true
+			}
+		}
+		// A named jail that isn't running reads "unknown", matching how an
+		// unmounted fs behaves. Use jail.count to alert on one disappearing.
+		return 0, false
+	case "proc":
+		// Counts come from [collect] proc_watch, so 0 genuinely means "not
+		// running" rather than "wasn't looked for" — which is what makes
+		// `op = "<", threshold = 1` a working service-down rule. A name that
+		// isn't in proc_watch reads unknown, flagging the config mistake.
+		for _, w := range snap.Watch {
+			if w.Name == field {
+				return float64(w.Count), true
+			}
+		}
+		return 0, false
+	case "pf":
+		if snap.PF == nil {
+			return 0, false
+		}
+		switch field {
+		case "", "state_pct":
+			return snap.PF.StatePct, true
+		case "states":
+			return float64(snap.PF.States), true
+		case "drop_rate":
+			return snap.PF.DropRate, true
+		case "match_rate":
+			return snap.PF.MatchRate, true
+		case "search_rate":
+			return snap.PF.SearchRate, true
+		case "insert_rate":
+			return snap.PF.InsertRate, true
+		}
 	}
 	return 0, false
+}
+
+// zfsValue reduces a per-pool field to its worst case across all pools.
+func zfsValue(snap collect.Snapshot, field string) (float64, bool) {
+	if len(snap.ZFS) == 0 {
+		return 0, false
+	}
+	var pick func(collect.ZFSStats) (float64, bool)
+	switch field {
+	case "", "used_pct":
+		pick = func(z collect.ZFSStats) (float64, bool) { return z.UsedPct, true }
+	case "health":
+		pick = func(z collect.ZFSStats) (float64, bool) { return zfsHealthOrdinal(z.Health), true }
+	case "scan_pct":
+		pick = func(z collect.ZFSStats) (float64, bool) { return z.ScanPct, true }
+	case "scan_age_hours":
+		// Only pools with a known last-scan time take part; a pool that has
+		// never been scrubbed has no age to compare, and reporting 0 would
+		// read as "scrubbed just now" — the opposite of the truth.
+		pick = func(z collect.ZFSStats) (float64, bool) { return z.ScanAgeHours, z.ScanKnown }
+	default:
+		return 0, false
+	}
+	var max float64
+	found := false
+	for _, z := range snap.ZFS {
+		v, ok := pick(z)
+		if !ok {
+			continue
+		}
+		if !found || v > max {
+			max, found = v, true
+		}
+	}
+	return max, found
 }
 
 // maxOrNamed returns the value for the named entry, or the maximum across all
@@ -506,13 +621,48 @@ var metricFields = map[string][]string{
 	"mem":  {"", "used_pct", "used", "free"},
 	"swap": {"", "pct", "used"},
 	"load": {"", "load1", "load5", "load15"},
-	"disk": {"", "read_bps", "write_bps", "read_iops", "write_iops"},
-	"net":  {"", "rx_bps", "tx_bps", "rx_pps", "tx_pps"},
+	"disk": {"", "read_bps", "write_bps", "read_iops", "write_iops", "total_bps", "total_iops"},
+	"net": {"", "rx_bps", "tx_bps", "rx_pps", "tx_pps", "total_bps",
+		"rx_err", "tx_err", "err", "rx_drop", "tx_drop", "drop"},
+	"zfs":  {"", "used_pct", "health", "scan_pct", "scan_age_hours"},
+	"arc":  {"", "hit_rate", "size", "target"},
+	"pf":   {"", "state_pct", "states", "drop_rate", "match_rate", "search_rate", "insert_rate"},
 	"fs":   nil,
 	"temp": nil,
+	// jail accepts "count" or a jail name, so it is keyed like fs/temp.
+	"jail": nil,
+	// proc is keyed too, but unlike the others an empty field is useless:
+	// there is no "worst process" to fall back to.
+	"proc": nil,
 }
 
+// fieldRequired lists keyed metrics where an empty field can never resolve,
+// so Validate can say so instead of letting the rule sit at "unknown".
+var fieldRequired = map[string]bool{"proc": true}
+
 var validOps = []string{">", ">=", "<", "<=", "=="}
+
+// Value exposes the rule metric table outside the package. `beastie check`
+// uses it so the CLI and the alert engine resolve metric/field pairs through
+// one implementation — a check and a rule written the same way cannot
+// disagree about what they measure.
+func Value(snap collect.Snapshot, metric, field string) (float64, bool) {
+	return metricValue(snap, metric, field)
+}
+
+// Metrics lists every metric a rule (or `beastie check`) can name, sorted.
+func Metrics() []string {
+	out := make([]string, 0, len(metricFields))
+	for m := range metricFields {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Fields lists the fixed fields a metric accepts, or nil when the metric is
+// keyed by entry name (a mount, a sensor, a jail, a watched process).
+func Fields(metric string) []string { return metricFields[metric] }
 
 // Validate reports rules that can never fire because of a typo — an unknown
 // metric, an unsupported operator, or a field the metric doesn't have. These
@@ -542,6 +692,12 @@ func Validate(cfg config.AlertsConfig) []string {
 				"alert rule %q: metric %q has no field %q (want one of %s) — it will never fire",
 				name, r.Metric, r.Field, strings.Join(fields[1:], " ")))
 		}
+		if fields == nil && r.Field == "" && fieldRequired[r.Metric] {
+			warns = append(warns, fmt.Sprintf(
+				"alert rule %q: metric %q needs a field naming what to watch "+
+					"(and that name must appear in [collect] proc_watch) — it will never fire",
+				name, r.Metric))
+		}
 	}
 	return warns
 }
@@ -565,6 +721,10 @@ func diskField(field string) (func(collect.DiskStats) float64, bool) {
 		return func(d collect.DiskStats) float64 { return d.ReadIOPS }, true
 	case "write_iops":
 		return func(d collect.DiskStats) float64 { return d.WriteIOPS }, true
+	case "total_bps":
+		return func(d collect.DiskStats) float64 { return d.ReadBps + d.WriteBps }, true
+	case "total_iops":
+		return func(d collect.DiskStats) float64 { return d.ReadIOPS + d.WriteIOPS }, true
 	}
 	return nil, false
 }
@@ -579,6 +739,20 @@ func netField(field string) (func(collect.NetStats) float64, bool) {
 		return func(n collect.NetStats) float64 { return n.RxPps }, true
 	case "tx_pps":
 		return func(n collect.NetStats) float64 { return n.TxPps }, true
+	case "total_bps":
+		return func(n collect.NetStats) float64 { return n.RxBps + n.TxBps }, true
+	case "rx_err":
+		return func(n collect.NetStats) float64 { return n.RxErr }, true
+	case "tx_err":
+		return func(n collect.NetStats) float64 { return n.TxErr }, true
+	case "err":
+		return func(n collect.NetStats) float64 { return n.RxErr + n.TxErr }, true
+	case "rx_drop":
+		return func(n collect.NetStats) float64 { return n.RxDrop }, true
+	case "tx_drop":
+		return func(n collect.NetStats) float64 { return n.TxDrop }, true
+	case "drop":
+		return func(n collect.NetStats) float64 { return n.RxDrop + n.TxDrop }, true
 	}
 	return nil, false
 }

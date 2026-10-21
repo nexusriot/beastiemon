@@ -4,7 +4,10 @@
 function humanBytes(b) {
   if (b == null || b === 0) return '0 B';
   const units = ['B','KB','MB','GB','TB'];
-  const i = Math.min(Math.floor(Math.log2(b) / 10), units.length - 1);
+  // Clamp at both ends. Rates are fractional (round2'd bytes/sec), so a value
+  // under 1 B gives a negative exponent, and units[-1] is undefined — an idle
+  // interface would label its y-axis "512.0 undefined/s".
+  const i = Math.max(0, Math.min(Math.floor(Math.log2(b) / 10), units.length - 1));
   return (b / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
 }
 
@@ -90,6 +93,10 @@ const state = {
   netIface: null,
   diskDev: null,
   latestSnap: null,
+  // paused freezes the whole live view so a spike can be read and exported
+  // instead of scrolling off the left edge. The SSE connection stays open,
+  // so resuming is immediate.
+  paused: false,
 };
 
 
@@ -207,7 +214,10 @@ async function fetchSeries(metric, extra = '') {
 }
 
 async function loadCPU() {
-  const d = await fetchSeries('cpu', '&band=1');
+  // cores=0: the per-core columns (and their band pairs) are not plotted
+  // here — the live strip under the chart renders them from the stream —
+  // so on a 16-core box this drops 48 unused columns per range change.
+  const d = await fetchSeries('cpu', '&band=1&cores=0');
   const col = {};
   d.labels.forEach((l, i) => { col[l] = d.data[i]; });
   const n = (col.ts || []).length;
@@ -219,13 +229,13 @@ async function loadLoad() { const d = await fetchSeries('load'); buildLoadChart(
 async function loadMem()  { const d = await fetchSeries('mem');  buildMemChart(d.data); }
 
 async function loadNet(iface = '') {
-  const extra = iface ? `&iface=${iface}` : '';
+  const extra = iface ? `&iface=${encodeURIComponent(iface)}` : '';
   const d = await fetchSeries('net', extra);
   buildNetChart(d.data);
 }
 
 async function loadDisk(dev = '') {
-  const extra = dev ? `&dev=${dev}` : '';
+  const extra = dev ? `&dev=${encodeURIComponent(dev)}` : '';
   const d = await fetchSeries('disk', extra);
   buildDiskChart(d.data);
 }
@@ -266,6 +276,10 @@ function rangeSeconds() {
 }
 
 function applyLiveSnap(snap) {
+  // Frozen: drop the frame rather than buffering it. Catching up on resume
+  // would replay a burst of points the operator never asked to see, and the
+  // seeded history is re-fetched by loadAll() anyway.
+  if (state.paused) return;
   state.latestSnap = snap;
   // Whole seconds, matching the integer Unix timestamps /api/series returns,
   // so seeded history and live points share one grid.
@@ -294,7 +308,13 @@ function applyLiveSnap(snap) {
   const mp = document.getElementById('mem-pct');
   if (mp) {
     mp.textContent = memPct.toFixed(1) + '%';
-    mp.style.color = memPct >= 90 ? COLORS.red : memPct >= 70 ? COLORS.orange : COLORS.text;
+    // The normal colour is the theme's text colour (what .card-val uses), read
+    // live so it follows the light/dark toggle. It must be a real value: the
+    // CSSOM silently ignores a style assignment of undefined, so a missing one
+    // would leave the figure stuck on its last warning colour after recovery.
+    mp.style.color = memPct >= 90 ? COLORS.red
+      : memPct >= 70 ? COLORS.orange
+      : cssVar('--text', '#e6edf3');
   }
   appendToChart(state.charts.mem, ts,
     [snap.mem?.used, snap.mem?.free, snap.mem?.swap_used]);
@@ -336,8 +356,72 @@ function applyLiveSnap(snap) {
   renderZFS(snap.zfs || [], snap.arc);
   renderJails(snap.jails || []);
 
+  // Per-core distribution, pf, and watched processes.
+  renderCores(snap.cpu?.per_core || []);
+  renderPF(snap.pf);
+  renderWatch(snap.watch || []);
+
   // Build iface / dev tabs if not yet built.
   buildIfaceTabs(snap.net || [], snap.disk || []);
+}
+
+// renderCores draws one small bar per core. This is deliberately a live-only
+// view: per-core history exists at /api/series?metric=cpu but costs a column
+// per core, and what an operator wants from it — "is one core pinned while
+// the rest idle?" — is a question about right now.
+function renderCores(cores) {
+  const el = document.getElementById('cpu-cores');
+  if (!el) return;
+  if (!cores.length) { el.innerHTML = ''; return; }
+  el.innerHTML = cores.map((v, i) => {
+    const cls = v >= 90 ? 'crit' : v >= 70 ? 'warn' : '';
+    return `<div class="core-cell">
+      <div class="core-label"><span>cpu${i}</span><span>${v.toFixed(0)}%</span></div>
+      <div class="core-track"><div class="core-fill ${cls}" style="width:${Math.max(0, Math.min(100, v)).toFixed(1)}%"></div></div>
+    </div>`;
+  }).join('');
+}
+
+function renderPF(pf) {
+  const card = document.getElementById('card-pf');
+  if (!card) return;
+  if (!pf) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const head = document.getElementById('pf-states');
+  if (head) {
+    head.textContent = pf.enabled ? `${pf.states} states` : 'disabled';
+    head.style.color = pf.enabled ? cssVar('--text', '#e6edf3') : COLORS.orange;
+  }
+
+  const rows = [];
+  if (pf.state_limit) {
+    // State-table utilisation is the number worth watching: exhausting it
+    // drops connections with nothing in the logs to explain it.
+    const cls = pf.state_pct >= 90 ? 'crit' : pf.state_pct >= 75 ? 'warn' : '';
+    rows.push(['state table', `${pf.states} / ${pf.state_limit} (${(pf.state_pct ?? 0).toFixed(1)}%)`, cls]);
+  }
+  rows.push(['match', `${(pf.match_rate ?? 0).toFixed(0)}/s`, '']);
+  rows.push(['searches', `${(pf.search_rate ?? 0).toFixed(0)}/s`, '']);
+  rows.push(['inserts', `${(pf.insert_rate ?? 0).toFixed(0)}/s`, '']);
+  rows.push(['drops (memory/state-limit/congestion)',
+    `${(pf.drop_rate ?? 0).toFixed(0)}/s`, pf.drop_rate > 0 ? 'crit' : '']);
+
+  document.getElementById('pf-grid').innerHTML = rows.map(([k, v, cls]) =>
+    `<div class="pf-row"><span class="pf-key">${escapeHtml(k)}</span><span class="pf-val ${cls}">${escapeHtml(v)}</span></div>`
+  ).join('');
+}
+
+function renderWatch(watch) {
+  const el = document.getElementById('watch-grid');
+  if (!el) return;
+  el.innerHTML = watch.map(w => {
+    const up = w.count > 0;
+    return `<div class="watch-row">
+      <span>${escapeHtml(w.name)}</span>
+      <span class="watch-state ${up ? 'up' : 'down'}">${up ? `running (${w.count})` : 'NOT RUNNING'}</span>
+    </div>`;
+  }).join('');
 }
 
 function renderZFS(pools, arc) {
@@ -353,14 +437,49 @@ function renderZFS(pools, arc) {
 
   document.getElementById('zfs-grid').innerHTML = pools.map(p => {
     const cls = p.used_pct >= 90 ? 'crit' : p.used_pct >= 75 ? 'warn' : '';
+    const health = p.health || '';
+    const healthCls = health && health !== 'ONLINE' ? 'crit' : '';
     return `<div class="fs-row">
       <div class="fs-header">
-        <span class="fs-mount">${escapeHtml(p.pool)} <span class="fs-info">${escapeHtml(p.health || '')}</span></span>
+        <span class="fs-mount">${escapeHtml(p.pool)}
+          <span class="fs-info ${healthCls}">${escapeHtml(health)}</span></span>
         <span class="fs-info">${humanBytes(p.alloc)} / ${humanBytes(p.size)} (${p.used_pct.toFixed(1)}%)</span>
       </div>
       <div class="fs-bar-track"><div class="fs-bar-fill ${cls}" style="width:${p.used_pct.toFixed(1)}%"></div></div>
+      ${scanLine(p)}
     </div>`;
   }).join('');
+
+  renderDatasets();
+}
+
+// scanLine summarises a pool's scrub/resilver state. A pool that has never
+// been scrubbed, or one whose last scrub is months old, is flagged: silent
+// bit rot is exactly what scrubbing exists to catch.
+function scanLine(p) {
+  if (!p.scan) return '';
+  if (p.scan === 'scrub' || p.scan === 'resilver') {
+    return `<div class="fs-scan">${p.scan} in progress — ${(p.scan_pct ?? 0).toFixed(1)}% done</div>`;
+  }
+  if (p.scan === 'none') {
+    return '<div class="fs-scan warn">never scrubbed</div>';
+  }
+  if (!p.scan_known) return '';
+  const hours = p.scan_age_hours ?? 0;
+  const age = hours >= 48 ? `${Math.round(hours / 24)} days` : `${Math.round(hours)} hours`;
+  const label = p.scan === 'resilver_done' ? 'resilvered' : 'scrubbed';
+  // 35 days: a month of monthly-scrub schedule plus slack.
+  return `<div class="fs-scan ${hours > 35 * 24 ? 'warn' : ''}">${label} ${age} ago</div>`;
+}
+
+function renderDatasets() {
+  const el = document.getElementById('dataset-grid');
+  if (!el) return;
+  const sets = state.latestSnap?.datasets || [];
+  el.innerHTML = sets.map(d => `<div class="dataset-row">
+    <span class="ds-name">${escapeHtml(d.name)}</span>
+    <span>used ${humanBytes(d.used)} · avail ${humanBytes(d.avail)}</span>
+  </div>`).join('');
 }
 
 function renderJails(jails) {
@@ -547,6 +666,55 @@ function connectSSE() {
 }
 
 
+// ---- Freeze & export ------------------------------------------------
+
+function setPaused(on) {
+  state.paused = on;
+  document.body.classList.toggle('paused', on);
+  const btn = document.getElementById('pause-toggle');
+  if (btn) {
+    btn.textContent = on ? '▶' : '⏸';
+    btn.classList.toggle('paused', on);
+    btn.title = on ? 'Resume live updates' : 'Freeze the live view';
+  }
+  // Resuming re-seeds from history so the gap that accrued while frozen is
+  // filled in, rather than leaving a flat line across it.
+  if (!on) loadAll();
+}
+
+// exportCSV downloads what a chart currently shows. The point is the visible
+// range: whatever you froze and were looking at is what lands in the file.
+function exportCSV(key) {
+  const chart = state.charts[key];
+  if (!chart || !chart.data || !chart.data[0]) return;
+  const data = chart.data;
+  const headers = ['time', ...chart.series.slice(1).map(s => s.label || '')];
+  const rows = [headers.join(',')];
+  for (let i = 0; i < data[0].length; i++) {
+    const cells = [new Date(data[0][i] * 1000).toISOString()];
+    for (let c = 1; c < data.length; c++) {
+      const v = data[c][i];
+      cells.push(v == null ? '' : v);
+    }
+    rows.push(cells.join(','));
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  downloadBlob(`beastiemon-${key}-${stamp}.csv`, rows.join('\n'));
+}
+
+function downloadBlob(filename, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoke on the next turn of the event loop: Safari aborts the download
+  // if the object URL goes away in the same tick as the click.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 function applyTheme(t) {
   document.documentElement.dataset.theme = t;
   const btn = document.getElementById('theme-toggle');
@@ -602,6 +770,25 @@ async function init() {
 
   // Theme toggle
   document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
+
+  // Freeze / resume
+  document.getElementById('pause-toggle')
+    .addEventListener('click', () => setPaused(!state.paused));
+
+  // One delegated handler for every card's CSV button, so cards added later
+  // need no extra wiring.
+  document.addEventListener('click', e => {
+    const key = e.target?.dataset?.export;
+    if (key) exportCSV(key);
+  });
+
+  // Space toggles the freeze, the way a media player would — but not while
+  // the range picker has focus, where space opens the dropdown.
+  document.addEventListener('keydown', e => {
+    if (e.code !== 'Space' || e.target !== document.body) return;
+    e.preventDefault();
+    setPaused(!state.paused);
+  });
 }
 
 document.addEventListener('DOMContentLoaded', init);

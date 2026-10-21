@@ -15,9 +15,21 @@ func TestParseZpoolList(t *testing.T) {
 		pools[0].UsedPct != 40 || pools[0].Health != "ONLINE" {
 		t.Fatalf("pool[0] mismatch: %+v", pools[0])
 	}
-	// capacity=0 with a non-zero size should fall back to alloc/size.
+	// An empty pool really is 0% used; nothing to fall back to.
 	if pools[1].UsedPct != 0 || pools[1].Health != "DEGRADED" {
 		t.Fatalf("pool[1] mismatch: %+v", pools[1])
+	}
+}
+
+// `zpool list -p` prints capacity as a whole-number percent, so a pool under
+// 1% full reports 0. Recomputing from alloc/size recovers the real figure.
+func TestParseZpoolListCapacityFallback(t *testing.T) {
+	pools := parseZpoolList("tank\t1000000000\t4000000\t996000000\t0\tONLINE\n")
+	if len(pools) != 1 {
+		t.Fatalf("want 1 pool, got %d", len(pools))
+	}
+	if pools[0].UsedPct != 0.4 {
+		t.Fatalf("want used_pct recomputed to 0.4, got %v", pools[0].UsedPct)
 	}
 }
 
@@ -45,6 +57,19 @@ func TestParseJlsN(t *testing.T) {
 	if jails[0].JID != 1 || jails[0].Name != "web" ||
 		jails[0].Host != "web.local" || jails[0].Path != "/jails/web" {
 		t.Fatalf("jail[0] mismatch: %+v", jails[0])
+	}
+}
+
+// Tokens are keyed, so order doesn't matter and unrecognised parameters are
+// ignored; the split is on the first '=', so a value may contain one.
+func TestParseJlsNTokenHandling(t *testing.T) {
+	jails := parseJlsN("name=web path=/jails/a=b osreldate=1400097 jid=7\n")
+	if len(jails) != 1 {
+		t.Fatalf("want 1 jail, got %d", len(jails))
+	}
+	j := jails[0]
+	if j.JID != 7 || j.Name != "web" || j.Path != "/jails/a=b" {
+		t.Fatalf("token handling wrong: %+v", j)
 	}
 }
 

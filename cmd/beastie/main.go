@@ -10,12 +10,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	psutil_host "github.com/shirou/gopsutil/v3/host"
 
+	"github.com/nexusriot/beastiemon/internal/alert"
 	"github.com/nexusriot/beastiemon/internal/collect"
 	"github.com/nexusriot/beastiemon/internal/config"
 )
@@ -71,9 +73,15 @@ func printBanner() {
 
 // bar renders a coloured progress bar of given width.
 func bar(pct float64, width int) string {
+	// Clamp both ends: strings.Repeat panics on a negative count, and
+	// int(math.Round(NaN)) is an unspecified (typically very negative) value,
+	// so an unreadable percentage would take the whole command down.
 	filled := int(math.Round(pct / 100 * float64(width)))
 	if filled > width {
 		filled = width
+	}
+	if filled < 0 || math.IsNaN(pct) {
+		filled = 0
 	}
 	colour := green
 	switch {
@@ -161,6 +169,115 @@ func printNet(snap collect.Snapshot) {
 			humanBytes(uint64(n.RxBps))+"/s",
 			humanBytes(uint64(n.TxBps))+"/s",
 			n.RxPps, n.TxPps)
+		if t := netTrouble(n); t != "" {
+			fmt.Println(t)
+		}
+	}
+}
+
+// netTrouble renders an error/drop line, and only when there is something to
+// say — a healthy interface shouldn't carry four zeroes across the output.
+func netTrouble(n collect.NetStats) string {
+	if n.RxErr == 0 && n.TxErr == 0 && n.RxDrop == 0 && n.TxDrop == 0 {
+		return ""
+	}
+	return fmt.Sprintf("        "+red+"err rx:%.0f/s tx:%.0f/s  drop rx:%.0f/s tx:%.0f/s"+reset,
+		n.RxErr, n.TxErr, n.RxDrop, n.TxDrop)
+}
+
+func printZFS(snap collect.Snapshot) {
+	for _, z := range snap.ZFS {
+		hcol := green
+		if z.Health != "" && z.Health != "ONLINE" {
+			hcol = red
+		}
+		fmt.Printf(bold+"ZFS"+reset+"     %-12s %s %s%.1f%%%s  %s%s%s  %s\n",
+			z.Pool, bar(z.UsedPct, 16), bold, z.UsedPct, reset,
+			hcol, z.Health, reset, scanSummary(z))
+	}
+	for _, d := range snap.Datasets {
+		fmt.Printf("        "+gray+"%-28s used:%-9s avail:%s"+reset+"\n",
+			d.Name, humanBytes(d.Used), humanBytes(d.Avail))
+	}
+	if arc := snap.ARC; arc != nil {
+		fmt.Printf(bold+"ARC"+reset+"     %s  %shit %.0f%%%s\n",
+			humanBytes(arc.Size), cyan, arc.HitRate, reset)
+	}
+}
+
+// scanSummary describes a pool's scrub state in one phrase.
+func scanSummary(z collect.ZFSStats) string {
+	switch z.Scan {
+	case "scrub", "resilver":
+		return fmt.Sprintf(gray+"%s %.1f%%"+reset, z.Scan, z.ScanPct)
+	case "scrub_done", "resilver_done":
+		if !z.ScanKnown {
+			return ""
+		}
+		return fmt.Sprintf(gray+"scrubbed %s ago"+reset, humanHours(z.ScanAgeHours))
+	case "none":
+		return yellow + "never scrubbed" + reset
+	}
+	return ""
+}
+
+// humanHours renders a scrub age at the resolution an operator cares about.
+func humanHours(h float64) string {
+	if h >= 48 {
+		return fmt.Sprintf("%.0fd", h/24)
+	}
+	return fmt.Sprintf("%.0fh", h)
+}
+
+func printJails(snap collect.Snapshot) {
+	for _, j := range snap.Jails {
+		fmt.Printf(bold+"JAIL"+reset+"    %-4d %-16s %-24s "+gray+"%d procs"+reset+"\n",
+			j.JID, j.Name, j.Host, j.Procs)
+	}
+}
+
+func printPF(snap collect.Snapshot) {
+	pf := snap.PF
+	if pf == nil {
+		fmt.Println(gray + "PF      (unavailable — needs [collect] pf and read access to /dev/pf)" + reset)
+		return
+	}
+	if !pf.Enabled {
+		fmt.Println(bold + "PF" + reset + "      " + yellow + "disabled" + reset)
+		return
+	}
+	states := fmt.Sprintf("%d", pf.States)
+	if pf.StateLimit > 0 {
+		states = fmt.Sprintf("%d/%d %s%.1f%%%s", pf.States, pf.StateLimit,
+			levelColour(pf.StatePct), pf.StatePct, reset)
+	}
+	fmt.Printf(bold+"PF"+reset+"      states:%s  "+gray+"match:%.0f/s search:%.0f/s"+reset,
+		states, pf.MatchRate, pf.SearchRate)
+	if pf.DropRate > 0 {
+		fmt.Printf("  %sdrops:%.0f/s%s", red, pf.DropRate, reset)
+	}
+	fmt.Println()
+}
+
+// levelColour applies the same thresholds bar() uses, for inline percentages.
+func levelColour(pct float64) string {
+	switch {
+	case pct >= 90:
+		return red
+	case pct >= 70:
+		return yellow
+	}
+	return green
+}
+
+func printWatch(snap collect.Snapshot) {
+	for _, w := range snap.Watch {
+		col, state := green, "running"
+		if w.Count == 0 {
+			col, state = red, "NOT RUNNING"
+		}
+		fmt.Printf(bold+"WATCH"+reset+"   %-20s %s%s%s "+gray+"(%d)"+reset+"\n",
+			w.Name, col, state, reset, w.Count)
 	}
 }
 
@@ -248,6 +365,20 @@ func printAll(snap collect.Snapshot) {
 	printTemps(snap)
 	printLoad(snap)
 	printUptime(snap)
+	// Opt-in subsystems print only when they produced something, so the
+	// default view is unchanged on a host that doesn't use them.
+	if len(snap.ZFS) > 0 {
+		printZFS(snap)
+	}
+	if len(snap.Jails) > 0 {
+		printJails(snap)
+	}
+	if snap.PF != nil {
+		printPF(snap)
+	}
+	if len(snap.Watch) > 0 {
+		printWatch(snap)
+	}
 	printProcs(snap)
 }
 
@@ -257,6 +388,9 @@ func printAll(snap collect.Snapshot) {
 var metricCommands = map[string]bool{
 	"status": true, "cpu": true, "mem": true, "net": true, "disk": true,
 	"fs": true, "temp": true, "proc": true, "load": true,
+	// Opt-in subsystems. These print an explanatory line rather than
+	// nothing when the matching [collect] switch is off.
+	"zfs": true, "jail": true, "pf": true, "watch": true,
 }
 
 // emitJSON prints the part of the snapshot relevant to cmd as indented JSON.
@@ -282,9 +416,32 @@ func emitJSON(cmd string, snap collect.Snapshot) {
 		enc.Encode(snap.Procs)
 	case "load":
 		enc.Encode(snap.Load)
+	case "zfs":
+		enc.Encode(struct {
+			Pools    []collect.ZFSStats   `json:"zfs"`
+			Datasets []collect.ZFSDataset `json:"datasets,omitempty"`
+			ARC      *collect.ARCStats    `json:"arc,omitempty"`
+		}{snap.ZFS, snap.Datasets, snap.ARC})
+	case "jail":
+		enc.Encode(snap.Jails)
+	case "pf":
+		enc.Encode(snap.PF)
+	case "watch":
+		enc.Encode(snap.Watch)
 	default: // status
 		enc.Encode(snap)
 	}
+}
+
+// topCadence is how often `top` actually repaints. Local sampling pays a full
+// delta warm-up per frame on top of the sleep between them, so the real
+// cadence is ~2× the interval (see DESIGN.md §10); a remote fetch returns
+// from the daemon's already-warm deltas, so there it is the interval itself.
+func topCadence(interval time.Duration, remote bool) time.Duration {
+	if remote {
+		return interval
+	}
+	return 2 * interval
 }
 
 // collectTimeout bounds collectOnce. The sampler sleeps one full interval to
@@ -372,11 +529,7 @@ func fetchRemote(cfg config.Config, target string) (collect.Snapshot, error) {
 	if err != nil {
 		return collect.Snapshot{}, err
 	}
-	if cfg.Auth.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.Auth.Token)
-	} else if cfg.Auth.BasicEnabled() {
-		req.SetBasicAuth(cfg.Auth.Username, cfg.Auth.Password)
-	}
+	authenticate(req, cfg)
 	resp, err := client.Do(req)
 	if err != nil {
 		return collect.Snapshot{}, fmt.Errorf("remote %s: %w", target, err)
@@ -396,6 +549,141 @@ func fetchRemote(cfg config.Config, target string) (collect.Snapshot, error) {
 		return collect.Snapshot{}, fmt.Errorf("remote: bad response: %w", err)
 	}
 	return snap, nil
+}
+
+// alertsResp mirrors the daemon's /api/alerts envelope.
+type alertsResp struct {
+	Enabled bool               `json:"enabled"`
+	Rules   []alert.RuleStatus `json:"rules"`
+	Events  []alert.Event      `json:"events"`
+}
+
+// fetchAlerts reads /api/alerts from a running daemon. The alert engine lives
+// in the daemon, so unlike the metric views this has no standalone mode:
+// there is no local state to read.
+func fetchAlerts(cfg config.Config, target string) (alertsResp, error) {
+	var out alertsResp
+	client, base, err := remoteBase(cfg, target)
+	if err != nil {
+		return out, err
+	}
+	req, err := http.NewRequest(http.MethodGet, base+"/api/alerts", nil)
+	if err != nil {
+		return out, err
+	}
+	authenticate(req, cfg)
+	resp, err := client.Do(req)
+	if err != nil {
+		return out, fmt.Errorf("remote %s: %w", target, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return out, errors.New("remote: unauthorized (set [auth] token or username/password in the config)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return out, fmt.Errorf("remote: HTTP %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, fmt.Errorf("remote: bad response: %w", err)
+	}
+	return out, nil
+}
+
+// runAlerts implements `beastie --remote <addr> alerts`. Exit status follows
+// the check-mode convention so it can double as a "is anything firing" probe:
+// 0 all clear, 2 something firing, 3 couldn't ask.
+func runAlerts(cfg config.Config, target string, jsonOut bool) {
+	if target == "" {
+		fmt.Fprintln(os.Stderr, "beastie: alerts needs --remote (the alert engine runs in beastied)")
+		os.Exit(3)
+	}
+	d, err := fetchAlerts(cfg, target)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "beastie: %v\n", err)
+		os.Exit(3)
+	}
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		enc.Encode(d)
+	} else {
+		printAlerts(d)
+	}
+	if firingCount(d.Rules) > 0 {
+		os.Exit(2)
+	}
+}
+
+func firingCount(rules []alert.RuleStatus) int {
+	n := 0
+	for _, r := range rules {
+		if r.State == "firing" {
+			n++
+		}
+	}
+	return n
+}
+
+func printAlerts(d alertsResp) {
+	if !d.Enabled && len(d.Events) == 0 {
+		fmt.Println(gray + "ALERTS  (none configured)" + reset)
+		return
+	}
+	for _, r := range d.Rules {
+		field := ""
+		if r.Field != "" {
+			field = "." + r.Field
+		}
+		fmt.Printf(bold+"ALERT"+reset+"   %-20s %s%-8s%s %-24s %s%.2f%s\n",
+			nameOr(r.Name, r.Metric), stateColour(r.State), r.State, reset,
+			fmt.Sprintf("%s%s %s %g", r.Metric, field, r.Op, r.Threshold),
+			bold, r.Value, reset)
+	}
+	if len(d.Events) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println(gray + "Recent events:" + reset)
+	for i, ev := range d.Events {
+		if i == 10 {
+			break
+		}
+		fmt.Printf("        %s  %s%-8s%s %s\n",
+			ev.Time.Local().Format("2006-01-02 15:04:05"),
+			stateColour(ev.State), ev.State, reset,
+			nameOr(ev.Rule, ev.Metric))
+	}
+}
+
+func nameOr(name, fallback string) string {
+	if name == "" {
+		return fallback
+	}
+	return name
+}
+
+func stateColour(state string) string {
+	switch state {
+	case "firing":
+		return red
+	case "pending":
+		return yellow
+	case "unknown":
+		return gray
+	case "resolved", "ok":
+		return green
+	}
+	return ""
+}
+
+// authenticate attaches the config's credentials: the bearer token if set,
+// else HTTP Basic.
+func authenticate(req *http.Request, cfg config.Config) {
+	if cfg.Auth.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.Auth.Token)
+	} else if cfg.Auth.BasicEnabled() {
+		req.SetBasicAuth(cfg.Auth.Username, cfg.Auth.Password)
+	}
 }
 
 // isTerminal reports whether f is a character device (a TTY). Used to decide
@@ -425,56 +713,88 @@ func applyColor(on bool) {
 	reset, bold, red, green, yellow, cyan, white, gray = "", "", "", "", "", "", "", ""
 }
 
+// checkDefault is the field `beastie check <metric>` uses when --field is not
+// given, plus the perfdata label for that default. The labels are the ones
+// the command has always printed and are load-bearing for anyone graphing the
+// perfdata, so they are spelled out rather than derived.
+type checkDefault struct{ field, label string }
+
+var checkDefaults = map[string]checkDefault{
+	"cpu":  {"total", "cpu.total%"},
+	"mem":  {"used_pct", "mem.used%"},
+	"swap": {"pct", "swap.used%"},
+	"load": {"load1", "load1"},
+	"fs":   {"max", "fs.max_used%"},
+	"temp": {"max", "temp.max_c"},
+	"net":  {"total_bps", "net.total_bps"},
+	"disk": {"total_bps", "disk.total_bps"},
+	"zfs":  {"used_pct", "zfs.max_used%"},
+	"arc":  {"hit_rate", "arc.hit_rate%"},
+	"jail": {"count", "jail.count"},
+	"pf":   {"state_pct", "pf.state_pct%"},
+	// proc has no sensible default: there is no "worst process", only the
+	// one you named. An empty field falls through to the unknown-field path.
+	"proc": {"", "proc"},
+}
+
 // checkValue returns the scalar `beastie check` compares against thresholds,
 // plus a short label. Higher is "worse" for every supported metric.
-func checkValue(snap collect.Snapshot, metric string) (float64, string, bool) {
-	switch metric {
-	case "cpu":
-		return snap.CPU.Total, "cpu.total%", true
-	case "mem":
-		return snap.Mem.UsedPct, "mem.used%", true
-	case "swap":
-		return snap.Mem.SwapPct, "swap.used%", true
-	case "load":
-		return snap.Load.Load1, "load1", true
-	case "fs":
-		var max float64
-		for _, f := range snap.FS {
-			if f.UsedPct > max {
-				max = f.UsedPct
-			}
-		}
-		return max, "fs.max_used%", true
-	case "temp":
-		var max float64
-		for _, t := range snap.Temps {
-			if t.Celsius > max {
-				max = t.Celsius
-			}
-		}
-		return max, "temp.max_c", true
-	case "net":
-		var sum float64
-		for _, n := range snap.Net {
-			sum += n.RxBps + n.TxBps
-		}
-		return sum, "net.total_bps", true
-	case "disk":
-		var sum float64
-		for _, d := range snap.Disk {
-			sum += d.ReadBps + d.WriteBps
-		}
-		return sum, "disk.total_bps", true
+//
+// The value itself comes from alert.Value, so a check and a [[alerts.rule]]
+// written the same way measure the same thing — there is one metric table in
+// the project, not two that can drift.
+//
+// ok is false for an unknown metric/field and for a metric with nothing to
+// read: no sensors, no matching mount, no interfaces, a subsystem that isn't
+// enabled. Those must not collapse to a green "0.00" — a host whose coretemp
+// module never loaded, or whose monitored filesystem is not mounted, is
+// exactly the case an operator needs told about.
+func checkValue(snap collect.Snapshot, metric, field string) (float64, string, bool) {
+	def, known := checkDefaults[metric]
+	if !known {
+		return 0, "", false
 	}
-	return 0, "", false
+	label := def.label
+	if field == "" {
+		field = def.field
+	} else {
+		// An explicit selector names itself, so "fs./var" rather than the
+		// default's "fs.max_used%".
+		label = metric + "." + field
+	}
+	if field == "" {
+		return 0, "", false // proc without --field
+	}
+	// For metrics with a fixed field list, reject an unknown name up front so
+	// the caller can say "no such field" instead of "nothing to measure" —
+	// a typo and an unreadable sensor are different problems with different
+	// fixes. Keyed metrics (fs, temp, jail, proc) accept any name by design,
+	// so a miss there really is missing data.
+	if fields := alert.Fields(metric); fields != nil && !slices.Contains(fields, field) {
+		return 0, "", false
+	}
+	val, ok := alert.Value(snap, metric, field)
+	return val, label, ok
 }
 
 // evalCheck applies nagios threshold semantics; thresholds <= 0 are "unset".
-func evalCheck(val, warn, crit float64) (string, int) {
-	if crit > 0 && val >= crit {
+//
+// below inverts the comparison for the metrics where small is bad — a process
+// count, free space, an ARC hit rate. The two directions are exact
+// complements (val >= t and val < t), so "--crit 1 --below" fires on exactly
+// the values "--crit 1" would not, and a service-down check reads as
+// "critical below 1 running".
+func evalCheck(val, warn, crit float64, below bool) (string, int) {
+	breach := func(threshold float64) bool {
+		if below {
+			return val < threshold
+		}
+		return val >= threshold
+	}
+	if crit > 0 && breach(crit) {
 		return "CRITICAL", 2
 	}
-	if warn > 0 && val >= warn {
+	if warn > 0 && breach(warn) {
 		return "WARNING", 1
 	}
 	return "OK", 0
@@ -487,12 +807,14 @@ func runCheck(getSnap snapshotFn, args []string) {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	warn := fs.Float64("warn", 0, "warning threshold")
 	crit := fs.Float64("crit", 0, "critical threshold")
+	field := fs.String("field", "", "metric-specific selector, e.g. a mount, sensor, or jail name")
+	below := fs.Bool("below", false, "treat lower values as worse (e.g. a process count that must stay above 0)")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(3)
 	}
 	metric := fs.Arg(0)
 	if metric == "" {
-		fmt.Println("UNKNOWN: check needs a metric (cpu|mem|swap|load|fs|temp|net|disk)")
+		fmt.Printf("UNKNOWN: check needs a metric (%s)\n", strings.Join(alert.Metrics(), "|"))
 		os.Exit(3)
 	}
 	snap, err := getSnap()
@@ -500,12 +822,20 @@ func runCheck(getSnap snapshotFn, args []string) {
 		fmt.Printf("UNKNOWN: %v\n", err)
 		os.Exit(3)
 	}
-	val, label, ok := checkValue(snap, metric)
+	val, label, ok := checkValue(snap, metric, *field)
 	if !ok {
-		fmt.Printf("UNKNOWN: unknown metric %q\n", metric)
+		switch {
+		case label == "" && *field != "":
+			fmt.Printf("UNKNOWN: metric %q has no field %q\n", metric, *field)
+		case label == "":
+			fmt.Printf("UNKNOWN: unknown metric %q (want one of %s)\n",
+				metric, strings.Join(alert.Metrics(), "|"))
+		default:
+			fmt.Printf("UNKNOWN: %s has no readings (nothing to measure)\n", label)
+		}
 		os.Exit(3)
 	}
-	status, code := evalCheck(val, *warn, *crit)
+	status, code := evalCheck(val, *warn, *crit, *below)
 	fmt.Printf("%s: %s = %.2f | value=%.2f;%.0f;%.0f\n", status, label, val, val, *warn, *crit)
 	os.Exit(code)
 }
@@ -524,8 +854,13 @@ func usage() {
 	fmt.Printf("  %-10s  %s\n", "temp", "sensor temperatures")
 	fmt.Printf("  %-10s  %s\n", "proc", "top processes by CPU")
 	fmt.Printf("  %-10s  %s\n", "load", "load average")
+	fmt.Printf("  %-10s  %s\n", "zfs", "ZFS pools, scrub state, datasets, ARC")
+	fmt.Printf("  %-10s  %s\n", "jail", "running jails")
+	fmt.Printf("  %-10s  %s\n", "pf", "pf state table and counters")
+	fmt.Printf("  %-10s  %s\n", "watch", "watched processes (proc_watch)")
 	fmt.Printf("  %-10s  %s\n", "top", "continuous refresh (Ctrl-C to quit)")
 	fmt.Printf("  %-10s  %s\n", "check", "nagios-style threshold check (exit 0/1/2/3)")
+	fmt.Printf("  %-10s  %s\n", "alerts", "rule states from a running daemon (needs --remote)")
 	fmt.Printf("  %-10s  %s\n", "version", "print version")
 	fmt.Println()
 	fmt.Println(bold + "Flags:" + reset)
@@ -535,7 +870,12 @@ func usage() {
 	fmt.Printf("  %-16s  %s\n", "--remote <addr>", "read from a running beastied: \"auto\", host:port, URL, or socket path")
 	fmt.Println(gray + "  (flags must precede the command; colour also auto-off when piped)" + reset)
 	fmt.Println()
-	fmt.Println(bold + "Check:" + reset + "  beastie check [--warn N] [--crit N] <cpu|mem|swap|load|fs|temp|net|disk>")
+	fmt.Println(bold + "Check:" + reset + "  beastie check [--warn N] [--crit N] [--field F] [--below] <metric>")
+	fmt.Printf("  metrics: %s\n", strings.Join(alert.Metrics(), " "))
+	fmt.Println(gray + "  --field selects within a metric: a mount (fs), sensor (temp), jail name," + reset)
+	fmt.Println(gray + "  watched process (proc), or a named field such as tx_bps / health / scan_age_hours." + reset)
+	fmt.Println(gray + "  --below flips the comparison for metrics where small is bad:" + reset)
+	fmt.Println(gray + "    beastie check --crit 1 --below --field sshd proc   # critical if sshd isn't running" + reset)
 	fmt.Println()
 	fmt.Print(gray + "Web UI runs via beastied on http://127.0.0.1:8088/" + reset + "\n")
 }
@@ -552,10 +892,14 @@ func main() {
 	// Colour + banner: on only for an interactive terminal, and never when
 	// NO_COLOR or --no-color is set. Keeps pipes/files/less free of escapes.
 	tty := isTerminal(os.Stdout)
-	if !wantColor(tty, os.Getenv("NO_COLOR"), *noColor) {
+	colour := wantColor(tty, os.Getenv("NO_COLOR"), *noColor)
+	if !colour {
 		applyColor(false)
 	}
-	showBanner = tty && !*noColor
+	// The banner rides on the same predicate as colour: it is ASCII art whose
+	// whole point is the red trident, and DESIGN.md §10 specifies NO_COLOR
+	// suppresses it as well as the escapes.
+	showBanner = colour
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -599,6 +943,10 @@ func main() {
 		runCheck(getSnap, flag.Args()[1:])
 		return
 
+	case "alerts":
+		runAlerts(cfg, *remote, *jsonOut)
+		return
+
 	case "top":
 		if *jsonOut {
 			// Stream one compact JSON snapshot per interval (NDJSON).
@@ -627,7 +975,7 @@ func main() {
 			}
 			printAll(snap)
 			fmt.Printf(gray+"\nRefreshing every %s — Ctrl-C to quit\n"+reset,
-				cfg.Collect.Interval.Duration)
+				topCadence(cfg.Collect.Interval.Duration, *remote != ""))
 			time.Sleep(cfg.Collect.Interval.Duration)
 		}
 
@@ -669,6 +1017,26 @@ func main() {
 			printProcs(snap)
 		case "load":
 			printLoad(snap)
+		case "zfs":
+			if len(snap.ZFS) == 0 {
+				fmt.Println(gray + "ZFS     (no pools — needs [collect] zfs = true on a ZFS host)" + reset)
+			} else {
+				printZFS(snap)
+			}
+		case "jail":
+			if len(snap.Jails) == 0 {
+				fmt.Println(gray + "JAIL    (no jails — needs [collect] jails = true)" + reset)
+			} else {
+				printJails(snap)
+			}
+		case "pf":
+			printPF(snap)
+		case "watch":
+			if len(snap.Watch) == 0 {
+				fmt.Println(gray + "WATCH   (nothing watched — set [collect] proc_watch)" + reset)
+			} else {
+				printWatch(snap)
+			}
 		default: // status
 			printAll(snap)
 		}

@@ -27,6 +27,7 @@ var version = "0.2.0"
 func main() {
 	cfgPath := flag.String("config", "/usr/local/etc/beastiemon.conf", "config file path")
 	vFlag := flag.Bool("version", false, "print version and exit")
+	tFlag := flag.Bool("t", false, "test the configuration and exit (0 ok, 1 problems)")
 	flag.Parse()
 
 	if *vFlag {
@@ -36,7 +37,17 @@ func main() {
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
+		if *tFlag {
+			// Report through the same channel as the other -t output rather
+			// than the log, so `beastied -t` is greppable from a script.
+			fmt.Printf("%s: %v\n", *cfgPath, err)
+			os.Exit(1)
+		}
 		log.Fatalf("config: %v", err)
+	}
+
+	if *tFlag {
+		os.Exit(testConfig(*cfgPath, cfg))
 	}
 
 	ring := store.NewRing(cfg.Collect.RingSize)
@@ -159,6 +170,54 @@ func main() {
 			}
 		}
 	}
+}
+
+// testConfig implements `beastied -t`: load the config, report anything that
+// would misbehave, and exit without starting anything. The rule warnings are
+// the same ones startup logs — but a rule typo discovered at startup has
+// already taken the reload with it, so being able to check first is the
+// difference between a safe `service beastied reload` and a silent gap in
+// monitoring. Returns the process exit code.
+func testConfig(path string, cfg config.Config) int {
+	warns := alert.Validate(cfg.Alerts)
+	for _, w := range warns {
+		fmt.Printf("%s: warning: %s\n", path, w)
+	}
+	// A rule naming a process that proc_watch never counts can only ever read
+	// "unknown", and that pairing spans two config sections, so Validate (which
+	// sees only [alerts]) cannot catch it.
+	for _, w := range unwatchedProcRules(cfg) {
+		warns = append(warns, w)
+		fmt.Printf("%s: warning: %s\n", path, w)
+	}
+	if len(warns) > 0 {
+		fmt.Printf("%s: configuration has %d problem(s)\n", path, len(warns))
+		return 1
+	}
+	fmt.Printf("%s: syntax ok (%s)\n", path, statusLine(cfg))
+	return 0
+}
+
+// unwatchedProcRules reports proc rules whose field is not in proc_watch.
+func unwatchedProcRules(cfg config.Config) []string {
+	watched := make(map[string]bool, len(cfg.Collect.ProcWatch))
+	for _, n := range cfg.Collect.ProcWatch {
+		watched[n] = true
+	}
+	var out []string
+	for _, r := range cfg.Alerts.Rules {
+		if r.Metric != "proc" || r.Field == "" || watched[r.Field] {
+			continue
+		}
+		name := r.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		out = append(out, fmt.Sprintf(
+			"alert rule %q: watches process %q, but it is not in [collect] proc_watch — it will never fire",
+			name, r.Field))
+	}
+	return out
 }
 
 // persistEvent adapts the SQLite store to the alert engine's event sink,

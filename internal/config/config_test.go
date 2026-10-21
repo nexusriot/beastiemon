@@ -109,3 +109,61 @@ func TestCoarseTierDefaults(t *testing.T) {
 		t.Errorf("explicit 0s must disable the coarse tier, got %v", cfg.Store.CoarseAfter.Duration)
 	}
 }
+
+func TestLoadNewCollectKnobs(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "beastiemon.conf")
+	conf := `[collect]
+pf = true
+zfs = true
+zfs_datasets = 10
+proc_watch = ["sshd", "nginx"]
+`
+	if err := os.WriteFile(p, []byte(conf), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Collect.PF || !cfg.Collect.ZFS {
+		t.Errorf("opt-in collectors not read: %+v", cfg.Collect)
+	}
+	if cfg.Collect.ZFSDatasets != 10 {
+		t.Errorf("zfs_datasets = %d, want 10", cfg.Collect.ZFSDatasets)
+	}
+	if len(cfg.Collect.ProcWatch) != 2 || cfg.Collect.ProcWatch[0] != "sshd" {
+		t.Errorf("proc_watch = %v", cfg.Collect.ProcWatch)
+	}
+}
+
+// Unlike the other count knobs, 0 is meaningful for zfs_datasets (collect
+// none) and is the default, so only a negative value gets clamped.
+func TestZFSDatasetsZeroIsMeaningful(t *testing.T) {
+	if def := Default(); def.Collect.ZFSDatasets != 0 {
+		t.Errorf("default zfs_datasets = %d, want 0", def.Collect.ZFSDatasets)
+	}
+
+	p := filepath.Join(t.TempDir(), "beastiemon.conf")
+	if err := os.WriteFile(p, []byte("[collect]\nzfs_datasets = -5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Collect.ZFSDatasets != 0 {
+		t.Errorf("negative zfs_datasets should clamp to 0, got %d", cfg.Collect.ZFSDatasets)
+	}
+}
+
+// The opt-in collectors must stay off unless a config asks for them: each
+// shells out every tick, and a default install should not pay for that.
+func TestOptInCollectorsDefaultOff(t *testing.T) {
+	def := Default()
+	if def.Collect.ZFS || def.Collect.Jails || def.Collect.PF {
+		t.Errorf("opt-in collectors should default off: %+v", def.Collect)
+	}
+	if len(def.Collect.ProcWatch) != 0 {
+		t.Errorf("proc_watch should default empty, got %v", def.Collect.ProcWatch)
+	}
+}

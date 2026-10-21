@@ -20,6 +20,7 @@ type Sampler struct {
 	net  *NetCollector
 	fs   *FSCollector
 	proc *ProcCollector
+	pf   *PFCollector
 }
 
 func NewSampler(cfg config.Config) *Sampler {
@@ -28,7 +29,8 @@ func NewSampler(cfg config.Config) *Sampler {
 		cfg:  cfg,
 		net:  NewNetCollector(cfg.Collect.NetExclude),
 		fs:   NewFSCollector(cfg.Collect.FSInclude),
-		proc: NewProcCollector(cfg.Collect.TopProcs),
+		proc: NewProcCollector(cfg.Collect.TopProcs, cfg.Collect.ProcWatch),
+		pf:   &PFCollector{},
 	}
 }
 
@@ -41,6 +43,9 @@ func (s *Sampler) Run(ctx context.Context) {
 	s.disk.Collect()
 	s.net.Collect()
 	s.proc.Collect()
+	if s.cfg.Collect.PF {
+		s.pf.Collect()
+	}
 	time.Sleep(s.cfg.Collect.Interval.Duration)
 
 	for {
@@ -62,6 +67,7 @@ func (s *Sampler) collect(t time.Time) Snapshot {
 	uptime, _ := psutil_host.Uptime()
 	load, _ := psutil_load.Avg()
 
+	procs, watch := s.proc.Collect()
 	snap := Snapshot{
 		Time:   t,
 		CPU:    s.cpu.Collect(),
@@ -70,16 +76,20 @@ func (s *Sampler) collect(t time.Time) Snapshot {
 		Net:    s.net.Collect(),
 		FS:     s.fs.Collect(),
 		Temps:  collectTemps(),
-		Procs:  s.proc.Collect(),
+		Procs:  procs,
+		Watch:  watch,
 		Uptime: uptime,
 	}
 	// Opt-in FreeBSD extras (no-ops / stubs elsewhere).
 	if s.cfg.Collect.ZFS {
-		snap.ZFS = collectZFS()
+		snap.ZFS, snap.Datasets = collectZFS(s.cfg.Collect.ZFSDatasets)
 		snap.ARC = collectARC()
 	}
 	if s.cfg.Collect.Jails {
 		snap.Jails = collectJails()
+	}
+	if s.cfg.Collect.PF {
+		snap.PF = s.pf.Collect()
 	}
 	if load != nil {
 		snap.Load = LoadStats{

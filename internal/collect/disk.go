@@ -1,6 +1,7 @@
 package collect
 
 import (
+	"sort"
 	"time"
 
 	psutil "github.com/shirou/gopsutil/v3/disk"
@@ -38,6 +39,10 @@ func (d *DiskCollector) Collect() []DiskStats {
 			})
 		}
 	}
+
+	// Same reason as NetCollector: psutil hands back a map, so sort by device
+	// to keep the emitted array order stable from tick to tick.
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Device < stats[j].Device })
 
 	d.prev = counters
 	d.prevAt = now

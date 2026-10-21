@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/nexusriot/beastiemon/internal/alert"
 	"github.com/nexusriot/beastiemon/internal/collect"
 	"github.com/nexusriot/beastiemon/internal/config"
 )
@@ -45,7 +48,7 @@ func TestEvalCheck(t *testing.T) {
 		{90, 0, 90, "CRITICAL", 2}, // crit boundary is inclusive
 	}
 	for _, c := range cases {
-		status, code := evalCheck(c.val, c.warn, c.crit)
+		status, code := evalCheck(c.val, c.warn, c.crit, false)
 		if status != c.status || code != c.code {
 			t.Errorf("evalCheck(%v,%v,%v)=%s/%d, want %s/%d",
 				c.val, c.warn, c.crit, status, code, c.status, c.code)
@@ -72,7 +75,7 @@ func TestCheckValue(t *testing.T) {
 		{"temp", 71, true}, // hottest sensor
 		{"bogus", 0, false},
 	} {
-		val, _, ok := checkValue(snap, c.metric)
+		val, _, ok := checkValue(snap, c.metric, "")
 		if ok != c.ok || (ok && val != c.want) {
 			t.Errorf("checkValue(%s)=%v,%v want %v,%v", c.metric, val, ok, c.want, c.ok)
 		}
@@ -106,10 +109,10 @@ func TestCheckValueNetDisk(t *testing.T) {
 			{Device: "ada1", ReadBps: 200, WriteBps: 300},
 		},
 	}
-	if val, label, ok := checkValue(snap, "net"); !ok || val != 200 || label != "net.total_bps" {
+	if val, label, ok := checkValue(snap, "net", ""); !ok || val != 200 || label != "net.total_bps" {
 		t.Fatalf("net: want 200 net.total_bps, got %v %q %v", val, label, ok)
 	}
-	if val, label, ok := checkValue(snap, "disk"); !ok || val != 2000 || label != "disk.total_bps" {
+	if val, label, ok := checkValue(snap, "disk", ""); !ok || val != 2000 || label != "disk.total_bps" {
 		t.Fatalf("disk: want 2000 disk.total_bps, got %v %q %v", val, label, ok)
 	}
 }
@@ -190,6 +193,166 @@ func TestMetricCommands(t *testing.T) {
 	for _, c := range []string{"", "frobnicate", "top", "check", "version", "help", "CPU"} {
 		if metricCommands[c] {
 			t.Errorf("command %q should not be in metricCommands", c)
+		}
+	}
+}
+
+// An array metric with no entries at all — no sensors loaded, no matching
+// mount, no interfaces — must not come back as a green 0.00. Both README and
+// DESIGN.md promise UNKNOWN over a false "OK: … = 0.00", and the alert engine
+// already reports "unknown" for exactly this case.
+func TestCheckValueEmptyMetricsAreUnknown(t *testing.T) {
+	empty := collect.Snapshot{CPU: collect.CPUStats{Total: 3}}
+	for _, metric := range []string{"fs", "temp", "net", "disk"} {
+		val, label, ok := checkValue(empty, metric, "")
+		if ok {
+			t.Errorf("checkValue(%s) on an empty snapshot returned ok with %v", metric, val)
+		}
+		// A label is still returned so runCheck can say which metric had
+		// nothing to read, rather than claiming the metric name was a typo.
+		if label == "" {
+			t.Errorf("checkValue(%s): want a label to distinguish this from an unknown metric", metric)
+		}
+	}
+	// An unknown metric stays label-free, which is how runCheck tells them apart.
+	if _, label, ok := checkValue(empty, "bogus", ""); ok || label != "" {
+		t.Errorf(`checkValue("bogus") = %q, %v; want "", false`, label, ok)
+	}
+	// Scalar metrics are always readable and must keep reporting.
+	if val, _, ok := checkValue(empty, "cpu", ""); !ok || val != 3 {
+		t.Errorf("checkValue(cpu) = %v, %v; want 3, true", val, ok)
+	}
+}
+
+// Negative or NaN percentages reach bar() whenever a collector can't read a
+// total (a zero-sized filesystem makes gopsutil hand back NaN), and
+// strings.Repeat panics on a negative count.
+func TestBarClampsOutOfRangePercent(t *testing.T) {
+	for _, pct := range []float64{math.NaN(), -5, -0.0001, 0, 50, 100, 150, math.Inf(1), math.Inf(-1)} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("bar(%v) panicked: %v", pct, r)
+				}
+			}()
+			bar(pct, 20)
+		}()
+	}
+}
+
+// `top` repaints at the interval only in remote mode; local sampling pays a
+// delta warm-up per frame, so the footer must not advertise the bare interval.
+func TestTopCadence(t *testing.T) {
+	if got := topCadence(time.Second, false); got != 2*time.Second {
+		t.Errorf("local cadence = %v, want 2s", got)
+	}
+	if got := topCadence(time.Second, true); got != time.Second {
+		t.Errorf("remote cadence = %v, want 1s", got)
+	}
+}
+
+// --below flips the comparison for metrics where small is bad. The two
+// directions are exact complements, so each case here also pins down that
+// the opposite direction would have answered differently.
+func TestEvalCheckBelow(t *testing.T) {
+	cases := []struct {
+		name            string
+		val, warn, crit float64
+		below           bool
+		status          string
+		code            int
+	}{
+		{"service down", 0, 0, 1, true, "CRITICAL", 2},
+		{"service up", 1, 0, 1, true, "OK", 0},
+		{"two running, want two", 2, 0, 2, true, "OK", 0},
+		{"one running, want two", 1, 0, 2, true, "CRITICAL", 2},
+		{"warn band", 3, 5, 2, true, "WARNING", 1},
+		{"free space ok", 40, 20, 10, true, "OK", 0},
+		{"free space low", 15, 20, 10, true, "WARNING", 1},
+		// Without --below the same numbers read the other way round.
+		{"same numbers, default direction", 0, 0, 1, false, "OK", 0},
+	}
+	for _, c := range cases {
+		status, code := evalCheck(c.val, c.warn, c.crit, c.below)
+		if status != c.status || code != c.code {
+			t.Errorf("%s: evalCheck(%v,%v,%v,below=%v) = %s/%d, want %s/%d",
+				c.name, c.val, c.warn, c.crit, c.below, status, code, c.status, c.code)
+		}
+	}
+}
+
+// --field routes through the alert engine's metric table, so a check and a
+// [[alerts.rule]] written the same way measure the same thing.
+func TestCheckValueWithField(t *testing.T) {
+	snap := collect.Snapshot{
+		CPU: collect.CPUStats{Total: 42, User: 30},
+		FS: []collect.FSStats{
+			{Mount: "/", UsedPct: 30}, {Mount: "/var", UsedPct: 88},
+		},
+		Net:   []collect.NetStats{{Interface: "em0", RxBps: 100, TxBps: 50, RxErr: 7}},
+		ZFS:   []collect.ZFSStats{{Pool: "tank", UsedPct: 70, Health: "DEGRADED"}},
+		Watch: []collect.ProcWatch{{Name: "sshd", Count: 0}},
+	}
+	cases := []struct {
+		metric, field string
+		want          float64
+		label         string
+	}{
+		// Defaults keep the labels the command has always printed.
+		{"cpu", "", 42, "cpu.total%"},
+		{"fs", "", 88, "fs.max_used%"},
+		{"net", "", 150, "net.total_bps"},
+		// An explicit selector names itself.
+		{"cpu", "user", 30, "cpu.user"},
+		{"fs", "/var", 88, "fs./var"},
+		{"fs", "/", 30, "fs./"},
+		{"net", "rx_err", 7, "net.rx_err"},
+		{"zfs", "health", 1, "zfs.health"},
+		{"proc", "sshd", 0, "proc.sshd"},
+	}
+	for _, c := range cases {
+		val, label, ok := checkValue(snap, c.metric, c.field)
+		if !ok {
+			t.Errorf("%s --field %q: not readable", c.metric, c.field)
+			continue
+		}
+		if val != c.want || label != c.label {
+			t.Errorf("%s --field %q = %v/%q, want %v/%q",
+				c.metric, c.field, val, label, c.want, c.label)
+		}
+	}
+}
+
+// An unknown field and an unreadable one are different problems with
+// different fixes, so checkValue has to let runCheck tell them apart: a
+// typo returns no label, missing data keeps one.
+func TestCheckValueDistinguishesTypoFromMissingData(t *testing.T) {
+	snap := collect.Snapshot{CPU: collect.CPUStats{Total: 1}}
+
+	if _, label, ok := checkValue(snap, "cpu", "totl"); ok || label != "" {
+		t.Errorf(`cpu --field totl = %q, %v; want "", false (a typo)`, label, ok)
+	}
+	// A mount that isn't mounted is a real selector against absent data.
+	if _, label, ok := checkValue(snap, "fs", "/var"); ok || label != "fs./var" {
+		t.Errorf(`fs --field /var = %q, %v; want "fs./var", false (missing data)`, label, ok)
+	}
+	// proc has no meaningful default, so no field at all is a usage error.
+	if _, label, ok := checkValue(snap, "proc", ""); ok || label != "" {
+		t.Errorf(`proc with no field = %q, %v; want "", false`, label, ok)
+	}
+}
+
+// Every metric the alert engine knows must be checkable, or `beastie check`
+// and the rule table would advertise different vocabularies.
+func TestCheckDefaultsCoverEveryAlertMetric(t *testing.T) {
+	for _, m := range alert.Metrics() {
+		if _, ok := checkDefaults[m]; !ok {
+			t.Errorf("metric %q is alertable but has no check default", m)
+		}
+	}
+	for m := range checkDefaults {
+		if !slices.Contains(alert.Metrics(), m) {
+			t.Errorf("check offers metric %q that the alert engine doesn't know", m)
 		}
 	}
 }

@@ -409,10 +409,16 @@ func TestValidate(t *testing.T) {
 // Validate's field table must stay in step with metricValue's switch: a field
 // Validate accepts has to actually resolve, and one it rejects must not.
 func TestValidateMatchesMetricValue(t *testing.T) {
+	// Every optional subsystem has to be present, or metricValue would
+	// legitimately reject its fields for want of data and the cross-check
+	// would be testing presence rather than field-name agreement.
 	snap := collect.Snapshot{
 		CPU:  collect.CPUStats{Total: 1},
 		Disk: []collect.DiskStats{{Device: "ada0"}},
 		Net:  []collect.NetStats{{Interface: "em0"}},
+		ZFS:  []collect.ZFSStats{{Pool: "zroot", Health: "ONLINE", ScanKnown: true}},
+		ARC:  &collect.ARCStats{Size: 1},
+		PF:   &collect.PFStats{Enabled: true},
 	}
 	for metric, fields := range metricFields {
 		if fields == nil {

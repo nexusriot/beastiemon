@@ -35,6 +35,11 @@ type SQLite struct {
 	coarseAge  time.Duration // re-aggregate rows older than this (0 = off)
 	coarseRes  time.Duration // coarse bucket width
 
+	// batchSize bounds one coarsen pass; defaults to coarsenBatch. A field
+	// rather than a constant so tests can exercise the batch-boundary paths
+	// without writing ten thousand rows.
+	batchSize int
+
 	mu  sync.Mutex
 	agg *bucketAgg // the bucket currently accumulating (nil until first sample)
 
@@ -108,6 +113,7 @@ func OpenSQLite(path string, opts Options) (*SQLite, error) {
 	}
 	s := &SQLite{
 		db:         db,
+		batchSize:  coarsenBatch,
 		resolution: opts.Resolution,
 		retention:  opts.Retention,
 		coarseAge:  opts.CoarseAfter,
@@ -262,7 +268,7 @@ func (s *SQLite) coarsen(cutoff time.Time, after int64) (last int64, more bool) 
 	}
 	rows, err := s.db.Query(
 		`SELECT ts, data, dmin, dmax FROM samples WHERE ts > ? AND ts < ? ORDER BY ts ASC LIMIT ?`,
-		after, cutoff.Unix(), coarsenBatch)
+		after, cutoff.Unix(), s.batchSize)
 	if err != nil {
 		return 0, false
 	}
@@ -288,19 +294,25 @@ func (s *SQLite) coarsen(cutoff time.Time, after int64) (last int64, more bool) 
 		return 0, false
 	}
 
-	full := len(batch) == coarsenBatch
+	full := len(batch) == s.batchSize
 	bucketOf := func(ts int64) time.Time { return time.Unix(ts, 0).Truncate(s.coarseRes) }
 	if full {
-		// The trailing bucket may be cut mid-group; push it to the next batch
-		// unless that would empty this one.
+		// The trailing bucket may be cut mid-group; push it to the next batch.
 		lastBucket := bucketOf(batch[len(batch)-1].ts)
 		trim := len(batch)
 		for trim > 0 && bucketOf(batch[trim-1].ts).Equal(lastBucket) {
 			trim--
 		}
-		if trim > 0 {
-			batch = batch[:trim]
+		if trim == 0 {
+			// A single coarse bucket wider than one batch (only reachable with
+			// a coarse_resolution/resolution ratio past the batch size). Folding
+			// it piecewise would write one partial aggregate per batch, each
+			// INSERT OR REPLACE silently discarding the last. Leave the bucket
+			// at fine resolution and resume past its end, which also keeps
+			// maintain's loop moving forward.
+			return lastBucket.Add(s.coarseRes).Unix() - 1, true
 		}
+		batch = batch[:trim]
 	}
 	last = batch[len(batch)-1].ts
 

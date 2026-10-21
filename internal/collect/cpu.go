@@ -1,6 +1,8 @@
 package collect
 
 import (
+	"math"
+
 	psutil "github.com/shirou/gopsutil/v3/cpu"
 )
 
@@ -52,8 +54,15 @@ func (c *CPUCollector) Collect() CPUStats {
 	return stats
 }
 
+// round2 rounds to two decimal places. It goes through math.Round rather than
+// an int conversion: `int` is 32 bits on the 386/arm FreeBSD targets the
+// Makefile can build, where v*100 overflows for any rate past ~21 MB/s and the
+// out-of-range float-to-int conversion yields garbage (a large negative number)
+// that then poisons the API, Prometheus, rollups, and alert thresholds.
+// math.Round is width-independent and rounds negatives half-away-from-zero
+// instead of truncating them toward zero.
 func round2(v float64) float64 {
-	return float64(int(v*100+0.5)) / 100
+	return math.Round(v*100) / 100
 }
 
 // deltaU64 returns cur-prev as a float64, clamped to 0 when the counter has

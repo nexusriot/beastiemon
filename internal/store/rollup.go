@@ -74,6 +74,7 @@ type bucketAgg struct {
 	core []stat  // per-core Total
 	mem  [8]stat // Total, Used, Free, Available, UsedPct, SwapTotal, SwapUsed, SwapPct
 	load [3]stat // Load1, Load5, Load15
+	pf   [6]stat // States, StatePct, Search, Insert, Match, Drop
 	net  keyedAgg
 	disk keyedAgg
 	fs   keyedAgg
@@ -84,11 +85,12 @@ type bucketAgg struct {
 func newBucketAgg(bucket time.Time) *bucketAgg {
 	return &bucketAgg{
 		bucket: bucket,
-		net:    newKeyedAgg(4),
-		disk:   newKeyedAgg(4),
-		fs:     newKeyedAgg(4),
-		temp:   newKeyedAgg(1),
-		zfs:    newKeyedAgg(4),
+		// Net carries eight fields since the error and drop rates joined it.
+		net:  newKeyedAgg(8),
+		disk: newKeyedAgg(4),
+		fs:   newKeyedAgg(4),
+		temp: newKeyedAgg(1),
+		zfs:  newKeyedAgg(4),
 	}
 }
 
@@ -121,7 +123,16 @@ func (a *bucketAgg) add(s collect.Snapshot) {
 	a.load[2].add(s.Load.Load15)
 
 	for _, n := range s.Net {
-		a.net.add(n.Interface, n.RxBps, n.TxBps, n.RxPps, n.TxPps)
+		a.net.add(n.Interface, n.RxBps, n.TxBps, n.RxPps, n.TxPps,
+			n.RxErr, n.TxErr, n.RxDrop, n.TxDrop)
+	}
+	if p := s.PF; p != nil {
+		a.pf[0].add(float64(p.States))
+		a.pf[1].add(p.StatePct)
+		a.pf[2].add(p.SearchRate)
+		a.pf[3].add(p.InsertRate)
+		a.pf[4].add(p.MatchRate)
+		a.pf[5].add(p.DropRate)
 	}
 	for _, d := range s.Disk {
 		a.disk.add(d.Device, d.ReadBps, d.WriteBps, d.ReadIOPS, d.WriteIOPS)
@@ -146,12 +157,29 @@ func (a *bucketAgg) finalize() (avg, lo, hi collect.Snapshot) {
 
 // build materializes one snapshot by applying pick to every accumulated field.
 func (a *bucketAgg) build(pick func(stat) float64) collect.Snapshot {
+	// Set-valued fields that can't be averaged are carried from the most
+	// recent sample in the bucket.
 	s := collect.Snapshot{
-		Time:   a.bucket,
-		Uptime: a.last.Uptime,
-		Procs:  a.last.Procs,
-		Jails:  a.last.Jails,
-		ARC:    a.last.ARC,
+		Time:     a.bucket,
+		Uptime:   a.last.Uptime,
+		Procs:    a.last.Procs,
+		Jails:    a.last.Jails,
+		ARC:      a.last.ARC,
+		Datasets: a.last.Datasets,
+		Watch:    a.last.Watch,
+	}
+	if a.last.PF != nil {
+		s.PF = &collect.PFStats{
+			// Enabled and the hard limit are configuration, not measurements.
+			Enabled:    a.last.PF.Enabled,
+			StateLimit: a.last.PF.StateLimit,
+			States:     uint64(pick(a.pf[0])),
+			StatePct:   pick(a.pf[1]),
+			SearchRate: pick(a.pf[2]),
+			InsertRate: pick(a.pf[3]),
+			MatchRate:  pick(a.pf[4]),
+			DropRate:   pick(a.pf[5]),
+		}
 	}
 	s.CPU = collect.CPUStats{
 		Total: pick(a.cpu[0]), User: pick(a.cpu[1]), Sys: pick(a.cpu[2]), Idle: pick(a.cpu[3]),
@@ -170,6 +198,7 @@ func (a *bucketAgg) build(pick func(stat) float64) collect.Snapshot {
 		f := a.net.fields[key]
 		s.Net = append(s.Net, collect.NetStats{
 			Interface: key, RxBps: pick(f[0]), TxBps: pick(f[1]), RxPps: pick(f[2]), TxPps: pick(f[3]),
+			RxErr: pick(f[4]), TxErr: pick(f[5]), RxDrop: pick(f[6]), TxDrop: pick(f[7]),
 		})
 	}
 	for _, key := range a.disk.order {
@@ -192,10 +221,18 @@ func (a *bucketAgg) build(pick func(stat) float64) collect.Snapshot {
 	}
 	for _, key := range a.zfs.order {
 		f := a.zfs.fields[key]
-		s.ZFS = append(s.ZFS, collect.ZFSStats{
-			Pool: key, Health: lastZFSHealth(a.last.ZFS, key),
+		z := collect.ZFSStats{
+			Pool: key,
 			Size: uint64(pick(f[0])), Alloc: uint64(pick(f[1])), Free: uint64(pick(f[2])), UsedPct: pick(f[3]),
-		})
+		}
+		// Health and scan state are strings/flags rather than numbers, so
+		// they come from the most recent sample like the other set-valued
+		// fields.
+		if last, ok := lastZFSPool(a.last.ZFS, key); ok {
+			z.Health, z.Scan = last.Health, last.Scan
+			z.ScanPct, z.ScanAgeHours, z.ScanKnown = last.ScanPct, last.ScanAgeHours, last.ScanKnown
+		}
+		s.ZFS = append(s.ZFS, z)
 	}
 	return s
 }
@@ -209,11 +246,11 @@ func lastFSIdentity(fs []collect.FSStats, mount string) (dev, fstype string) {
 	return "", ""
 }
 
-func lastZFSHealth(pools []collect.ZFSStats, pool string) string {
+func lastZFSPool(pools []collect.ZFSStats, pool string) (collect.ZFSStats, bool) {
 	for _, x := range pools {
 		if x.Pool == pool {
-			return x.Health
+			return x, true
 		}
 	}
-	return ""
+	return collect.ZFSStats{}, false
 }

@@ -13,7 +13,7 @@ GOFLAGS  := GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=0
 UPLOT_VER := 1.6.27
 UPLOT_URL := https://unpkg.com/uplot@$(UPLOT_VER)/dist
 
-.PHONY: all build vendor-js deps stage install pkg clean
+.PHONY: all build build-native vendor-js deps stage install pkg clean run lint fmt test
 
 all: deps vendor-js build
 

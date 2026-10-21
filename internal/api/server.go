@@ -275,10 +275,11 @@ type seriesResp struct {
 }
 
 // handleSeries returns a time series in uPlot format.
-// Query params: metric (cpu|mem|load|net|disk|temp|fs|proc|zfs|arc|jail),
-// range (e.g. 15m, 1h), iface= (net), dev= (disk), mount= (fs), pid= (proc),
-// pool= (zfs), jid= (jail),
-// band=1 (append <label>_min/<label>_max envelope columns per series).
+// Query params: metric (cpu|mem|load|net|neterr|disk|temp|fs|proc|procwatch|
+// zfs|arc|jail|pf), range (e.g. 15m, 1h), iface= (net, neterr), dev= (disk),
+// mount= (fs), pid= (proc), pool= (zfs), jid= (jail), name= (procwatch),
+// band=1 (append <label>_min/<label>_max envelope columns per series),
+// cores=0 (drop the per-core columns from metric=cpu).
 func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	metric := q.Get("metric")
@@ -358,7 +359,11 @@ func seriesColumns(metric string, snaps []collect.Snapshot, q url.Values) (label
 		}
 		cols = [][]float64{user, sys, idle, total}
 
-		if len(snaps) > 0 && len(snaps[0].CPU.PerCore) > 0 {
+		// Per-core columns are on by default for compatibility, but they
+		// dominate the payload on a big machine — and double again under
+		// band=1 — so a client that renders cores from the live stream
+		// instead (as the dashboard does) can opt out with cores=0.
+		if wantCores(q) && len(snaps) > 0 && len(snaps[0].CPU.PerCore) > 0 {
 			ncores := len(snaps[0].CPU.PerCore)
 			for c := 0; c < ncores; c++ {
 				labels = append(labels, fmt.Sprintf("cpu%d", c))
@@ -510,6 +515,63 @@ func seriesColumns(metric string, snaps []collect.Snapshot, q url.Values) (label
 		}
 		return labels, [][]float64{size, target, hit}, true
 
+	case "neterr":
+		// Errors and drops are charted apart from throughput: they share no
+		// useful axis with bytes/sec, and they are normally flat at zero.
+		iface := q.Get("iface")
+		rxe := make([]float64, len(snaps))
+		txe := make([]float64, len(snaps))
+		rxd := make([]float64, len(snaps))
+		txd := make([]float64, len(snaps))
+		for i, snap := range snaps {
+			for _, n := range snap.Net {
+				if iface != "" && n.Interface != iface {
+					continue
+				}
+				rxe[i] += n.RxErr
+				txe[i] += n.TxErr
+				rxd[i] += n.RxDrop
+				txd[i] += n.TxDrop
+			}
+		}
+		return []string{"rx_err", "tx_err", "rx_drop", "tx_drop"},
+			[][]float64{rxe, txe, rxd, txd}, true
+
+	case "pf":
+		labels = []string{"states", "state_pct", "match_rate", "drop_rate"}
+		states := make([]float64, len(snaps))
+		statePct := make([]float64, len(snaps))
+		match := make([]float64, len(snaps))
+		drop := make([]float64, len(snaps))
+		for i, snap := range snaps {
+			if snap.PF == nil {
+				continue
+			}
+			states[i] = float64(snap.PF.States)
+			statePct[i] = snap.PF.StatePct
+			match[i] = snap.PF.MatchRate
+			drop[i] = snap.PF.DropRate
+		}
+		return labels, [][]float64{states, statePct, match, drop}, true
+
+	case "procwatch":
+		// One count series per watched name, so "when did sshd stop" has an
+		// answer rather than just a current state.
+		name := q.Get("name")
+		for _, w := range collectWatchNames(snaps, name) {
+			labels = append(labels, w)
+			series := make([]float64, len(snaps))
+			for i, snap := range snaps {
+				for _, x := range snap.Watch {
+					if x.Name == w {
+						series[i] = float64(x.Count)
+					}
+				}
+			}
+			cols = append(cols, series)
+		}
+		return labels, cols, true
+
 	case "jail":
 		jid := q.Get("jid")
 		// Columns are the jails in the most recent snapshot (or just `jid`);
@@ -530,6 +592,16 @@ func seriesColumns(metric string, snaps []collect.Snapshot, q url.Values) (label
 		return labels, cols, true
 	}
 	return nil, nil, false
+}
+
+// wantCores reports whether metric=cpu should include the per-core columns.
+// Absent means yes; only an explicit 0/false turns them off.
+func wantCores(q url.Values) bool {
+	switch q.Get("cores") {
+	case "0", "false", "no":
+		return false
+	}
+	return true
 }
 
 // timestamps returns the unix-second timestamp column shared by every series.
@@ -735,6 +807,25 @@ func collectFSMounts(snaps []collect.Snapshot, filter string) []string {
 			if !seen[f.Mount] {
 				seen[f.Mount] = true
 				names = append(names, f.Mount)
+			}
+		}
+	}
+	return names
+}
+
+// collectWatchNames returns the distinct watched process names across snaps in
+// first-seen order. If filter is non-empty, only that name is returned.
+func collectWatchNames(snaps []collect.Snapshot, filter string) []string {
+	seen := map[string]bool{}
+	var names []string
+	for _, s := range snaps {
+		for _, w := range s.Watch {
+			if filter != "" && w.Name != filter {
+				continue
+			}
+			if !seen[w.Name] {
+				seen[w.Name] = true
+				names = append(names, w.Name)
 			}
 		}
 	}

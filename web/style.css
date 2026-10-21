@@ -379,3 +379,101 @@ main { padding: 20px 24px; }
   .beastie { display: none; }
   header { flex-direction: column; }
 }
+
+/* ---- Per-core strip (CPU card) ------------------------------------ */
+/* Fed by the live stream rather than the history endpoint, so it shows
+   the current distribution across cores beside the aggregate chart. */
+.core-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+.core-cell {
+  flex: 1 1 44px;
+  min-width: 44px;
+}
+.core-label {
+  font-size: 9px;
+  color: var(--muted);
+  font-family: monospace;
+  display: flex;
+  justify-content: space-between;
+}
+.core-track {
+  height: 5px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 2px;
+}
+.core-fill {
+  height: 100%;
+  background: var(--green);
+  transition: width 0.3s ease;
+}
+.core-fill.warn { background: var(--orange); }
+.core-fill.crit { background: var(--red); }
+
+/* ---- Card action buttons (CSV export) ----------------------------- */
+.card-act {
+  float: right;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 7px;
+}
+.card-act:hover { color: var(--text); border-color: var(--muted); }
+
+/* ---- Frozen state ------------------------------------------------- */
+/* The whole dashboard holds still while paused, so a spike can be read
+   (and exported) instead of scrolling away. */
+.theme-toggle.paused {
+  color: var(--orange);
+  border-color: var(--orange);
+}
+body.paused .live-dot { background: var(--orange); animation: none; }
+
+/* ---- pf card ------------------------------------------------------ */
+.pf-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  font-family: monospace;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+}
+.pf-row:last-child { border-bottom: none; }
+.pf-row .pf-key { color: var(--muted); }
+.pf-row .pf-val { color: var(--text); }
+.pf-row .pf-val.crit { color: var(--red); }
+.pf-row .pf-val.warn { color: var(--orange); }
+
+/* ---- Watched processes -------------------------------------------- */
+.watch-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  font-family: monospace;
+  padding: 4px 0;
+}
+.watch-row + .watch-row { border-top: 1px solid var(--border); }
+.watch-state.up   { color: var(--green); }
+.watch-state.down { color: var(--red); font-weight: 700; }
+
+/* ---- ZFS scrub state / datasets ------------------------------------ */
+.fs-scan { color: var(--muted); font-size: 11px; }
+.fs-scan.warn { color: var(--orange); }
+.dataset-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  font-family: monospace;
+  color: var(--muted);
+  padding: 2px 0;
+}
+.dataset-row .ds-name { color: var(--text); }
