@@ -188,7 +188,20 @@ beastiemon/
 │   ├── newsyslog.conf               # log-rotation rule (→ newsyslog.conf.d/)
 │   ├── +MANIFEST                    # pkg(8) manifest (%%VERSION%% substituted)
 │   └── pkg-descr
-├── Makefile                         # build / vendor / stage / pkg / install
+├── scripts/                         # the build itself; the Makefile calls these
+│   ├── build.sh                     # cross-compile both binaries for one target
+│   ├── stage.sh                     # lay out the $PREFIX install tree
+│   ├── mkpkg.sh                     # staged tree → .pkg (pkg(8), or mkpkg/)
+│   ├── mkpkg/main.go                # portable .pkg writer, stdlib only
+│   ├── release.sh                   # every architecture + SHA256SUMS
+│   ├── vendor-js.sh                 # fetch uPlot, point the dashboard at it
+│   └── Dockerfile                   # `gmake pkg-docker` / `dist-docker`
+├── test/e2e/                        # end-to-end suite (`gmake e2e`)
+│   ├── Dockerfile                   # the container it runs in
+│   ├── harness_test.go              # daemon/CLI harness
+│   └── *_test.go                    # server, alerts, CLI cases (tag: e2e)
+├── Makefile                         # thin wrapper over scripts/ + test targets
+├── .dockerignore                    # keeps build output out of both images
 ├── go.mod
 ├── go.sum
 ├── LICENSE                          # MIT
@@ -423,8 +436,8 @@ type Ring struct {
 |---------------|------------|---------|
 | `Push(s)`     | O(1)       | write   |
 | `Last()`      | O(1)       | read    |
-| `Since(t)`    | O(N)       | read    |
-| `All()`       | O(N)       | read    |
+| `Since(t)`    | O(N), O(N log N) after a clock step | read |
+| `All()`       | O(N), O(N log N) after a clock step | read |
 
 Default capacity is 3600 = one hour at 1 s. Each snapshot is ~2 KB in
 memory (Go structs, not JSON), so the buffer caps at ~7 MB and stays
@@ -432,6 +445,18 @@ bounded forever regardless of uptime.
 
 The ring itself has no on-disk persistence — a restart loses its hour of
 1 s-resolution history, and that keeps the hot path at ~60 lines with zero I/O.
+
+**`Since`/`All` return wall-clock order, not arrival order.** `Push` strips the
+monotonic reading `time.Now()` carries, and `Since` checks the result and sorts
+only when it has to (the ordinary case is one linear pass). Both halves matter.
+Arrival order is time order only while the clock moves forward; an NTP step
+backwards leaves later-stamped samples ahead of earlier ones, and those outlive
+the step — they stay until they age out, up to an hour at the default size. And
+`time.Before` silently compares the *monotonic* reading when both operands
+carry one, which never steps: keep it and the samples compare as ordered while
+the timestamps served from them run backwards. Two callers read this order as
+truth — the store/ring merge takes the first element as the oldest sample, and
+`/api/series` emits it as the timestamp column, which uPlot binary-searches.
 
 ### Optional SQLite history — `store.SQLite`
 
@@ -539,12 +564,20 @@ resolution, older points from the (downsampled) store, merged by timestamp
 ### `/api/series` — uPlot-shaped time series
 
 uPlot expects `[[timestamps], [series1], [series2], …]`. The handler
-returns exactly that shape so the JS doesn't need to transform the data:
+returns exactly that shape so the JS doesn't need to transform the data.
+
+Timestamps are seconds since the epoch **with the sub-second part kept**.
+`[collect] interval` accepts sub-second durations, and whole seconds would make
+every sample inside one second share an x value — uPlot binary-searches that
+column, and the dashboard drops any live point that does not advance it, so the
+extra resolution would be collected and then thrown away on the way to the
+screen. Rows from the SQLite store are keyed by whole seconds and come back
+with a zero fraction.
 
 ```json
 {
   "labels": ["ts", "user", "sys", "idle", "total", "cpu0", "cpu1", "cpu2", "cpu3"],
-  "data":   [[1717513283, 1717513284, …],
+  "data":   [[1717513283.004, 1717513284.003, …],
              [12.3, 11.8, …],
              [ 4.1,  3.9, …],
              [83.6, 84.3, …],
@@ -852,7 +885,12 @@ beastie version
 beastie help
 ```
 
-Flags (must precede the command): `-config <path>` for a non-default
+Flags must precede the command, and a flag-shaped argument after it is now
+rejected with a message showing the right form rather than dropped — Go's
+`flag` stops parsing at the first non-flag argument, so `beastie cpu --json`
+used to print coloured text and exit 0, which a script piping into `jq` reads
+as valid output. `check` is the exception: it takes its own flags after the
+subcommand. The flags themselves: `-config <path>` for a non-default
 config file, `--json` for machine-readable output, `--no-color` to force
 plain text, `--remote <addr>` to read from a running daemon.
 
@@ -985,6 +1023,12 @@ Properties:
 - Missing config file is non-fatal — defaults work everywhere.
 - Partial files are merged onto defaults — you only need to specify
   what you want to change.
+- Keys no field consumes — `intervall`, `[collekt]` — are collected by the
+  decoder's `Undecoded()` and reported by `beastied -t` and at startup/reload.
+  TOML accepts them silently, which means the setting is simply not applied and
+  the host monitors with a default nobody chose; that is the same class of
+  silent misconfiguration as a rule that can never fire, and gets the same
+  treatment. `-t` exits non-zero on them.
 - Nonsensical values are clamped back to defaults rather than crashing the
   daemon: `interval = "0s"` would panic `time.NewTicker`, `ring_size = 0`
   would panic the ring's first `Push`. `normalize` covers interval,
@@ -1172,8 +1216,11 @@ writes the PID file as root, then drops privileges before exec'ing
 `-p /var/run/beastied_child.pid`. The `reload_cmd` sends `SIGHUP` to the child
 PID so `service beastied reload` reaches `beastied` itself (config reload),
 not the supervisor. `newsyslog` still signals the *supervisor* pidfile, which
-makes `daemon(8)` reopen its `-o` log after a rotate — the two signals have
-distinct targets and don't collide.
+makes `daemon(8)` reopen its `-o` log after a rotate — but **only because the
+rc.d script passes `-H`**. Without that flag the supervisor keeps writing to
+the inode newsyslog just rotated away, and every line after the first rotation
+lands in a file nobody will read. The two signals have distinct targets and
+don't collide.
 
 #### 4. Unix-domain socket listener
 
@@ -1181,6 +1228,14 @@ distinct targets and don't collide.
 `listen()` helper removes any stale socket, `net.Listen("unix", …)`, then
 `chmod 0660`). Useful for local-only access — e.g. an nginx `proxy_pass` to
 the socket — with no TCP port exposed.
+
+The socket has to live somewhere the daemon user can write. `daemon(8) -u` has
+already dropped to `_beastie` by the time `beastied` binds, and `/var/run` is
+root's, so a path directly in it fails with `bind: permission denied` — and
+`daemon(8) -r` then respawns the daemon about once a second while
+`service status` still reports it running. The rc.d script's `start_precmd`
+therefore creates `${beastied_rundir}` (default `/var/run/beastied`) owned by
+the run-as user, and the sample config's socket example points inside it.
 
 ### Sample → publish loop
 
@@ -1237,12 +1292,12 @@ because the path doesn't exist in the stage tree.
 ### Makefile pipeline
 
 ```
-$ gmake VERSION=0.2.0 pkg
+$ gmake VERSION=0.4.0 pkg
    ├── deps          (go mod download / tidy)
    ├── vendor-js     (download uPlot, rewrite index.html, patch assets.go)
    ├── build         (GOOS=freebsd GOARCH=amd64; produces beastied, beastie)
    ├── stage         (lay out .stage/ with bins, rc.d, conf.sample)
-   └── pkg           (pkg create --format txz → .pkg/beastiemon-0.2.0.pkg)
+   └── pkg           (scripts/mkpkg.sh → .pkg/beastiemon-0.4.0.pkg)
 ```
 
 ### Install paths
@@ -1255,6 +1310,24 @@ $ gmake VERSION=0.2.0 pkg
 | `freebsd/beastiemon.conf`          | `/usr/local/etc/beastiemon.conf.sample`        |
 | (post-install hook copies sample)  | `/usr/local/etc/beastiemon.conf` (only if absent) |
 | `freebsd/newsyslog.conf`           | `/usr/local/etc/newsyslog.conf.d/beastied.conf` |
+
+### Two ways to write the package
+
+`scripts/mkpkg.sh` prefers `pkg(8)` and falls back to `scripts/mkpkg`, a
+stdlib-only writer, so a Linux or macOS workstation can cut a release without a
+FreeBSD host. The fallback emits the same layout — `+MANIFEST` first, then each
+file under its absolute install path, files only (a directory entry makes
+`pkg(8)` warn that it is "not specified in the manifest" and skip it) — with
+gzip rather than xz and no `+COMPACT_MANIFEST`, which only a repository
+catalogue reads. `pkg install` and `pkg check -s` accept either.
+
+The fallback is not only for hosts without `pkg(8)`: `pkg create` stamps the
+ABI of the machine it runs on, so asking it for another architecture yields an
+aarch64 payload labelled amd64. Cross-architecture builds therefore always take
+the portable path, which stamps exactly what it was asked for. `mkpkg` also
+checks the staged tree against the manifest's `files` list in both directions,
+turning a packaging slip into a build failure rather than a file that silently
+never installs.
 
 ### System user
 
@@ -1438,6 +1511,30 @@ failures. Crashing fast surfaces them in `rc.d`'s output; `daemon(8) -r`
 would auto-restart and you'd get crash loops without diagnostics
 otherwise — so we let `rc.d` show the error once and stop.
 
+### Optional subsystems fail loudly, not silently
+
+Degrading is right for an optional subsystem; doing it in silence is not. A
+store that cannot write and a webhook nobody answers both leave every other
+surface looking healthy — the startup line still says `store on`, the rule
+still reads `firing` in `/api/alerts` and on the dashboard — while history is
+being dropped and nobody is being paged. That is the output-side twin of a rule
+that cannot read its metric, and gets the same treatment: say so.
+
+Neither `internal/store` nor `internal/alert` logs (nothing under `internal/`
+does). Each exposes a sink the daemon wires to its logger:
+
+| Failure                                  | Reported as |
+|------------------------------------------|-------------|
+| Webhook POST fails or answers non-2xx    | `alert "<rule>": webhook <url> not delivered: …` |
+| History row / prune / event write fails  | `store: <operation> failed: … — history is not being saved` |
+| …and when either starts working again    | one line saying so |
+
+Both are rate-limited by shape rather than by a timer where that suffices: the
+alert engine's volume follows the operator's own `repeat` (0, the default, is
+one POST per episode), while the store reports at most once a minute — a full
+filesystem fails on *every* sample, and a line per second would bury the log
+and keep writing to the filesystem that just filled up.
+
 ### Client errors
 
 | Condition                              | HTTP status |
@@ -1475,7 +1572,7 @@ is portable.
 
 ```sh
 gmake build-native
-./beastied -config freebsd/beastiemon.conf
+./dist/linux-amd64/beastied -config freebsd/beastiemon.conf   # or `gmake run`
 ```
 
 CPU, memory, disk, network, filesystem, processes, persistence, alerts, and

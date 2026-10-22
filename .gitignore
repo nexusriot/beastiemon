@@ -7,21 +7,26 @@
 # OS cruft
 .DS_Store
 
-# Compiled binaries (the Makefile builds these into the repo root)
-/beastied
-/beastie
-
-# Build & packaging output (Makefile STAGE / PKGDIR / DIST)
+# Build & packaging output: dist/ holds the binaries scripts/build.sh writes
+# (one directory per GOOS-GOARCH), .stage/ the install tree, .pkg/ the
+# packages and their SHA256SUMS. `gmake clean` removes all three.
+/dist/
 /.stage/
 /.pkg/
-/dist/
+
+# The Makefile builds into dist/, but `go build ./cmd/...` from the repo root
+# drops these here, and `go build ./scripts/mkpkg` drops that one.
+/beastied
+/beastie
+/mkpkg
 
 # uPlot fetched by `gmake vendor-js` — reproducibly re-downloaded, not tracked.
 # (See DESIGN.md §9. Keep the committed assets.go/index.html on their CDN
 #  defaults so a plain `go build` works without this directory.)
 /web/vendor/
 
-# Go test & coverage artifacts
+# Go test & coverage artifacts. The e2e suite compiles to a binary too
+# (`go test -c -tags e2e`), which *.test covers.
 *.test
 *.out
 coverage.*

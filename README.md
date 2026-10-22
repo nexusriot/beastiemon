@@ -65,7 +65,7 @@ web UI and a colourful CLI.**
 If you already have a built `.pkg`:
 
 ```sh
-pkg install ./beastiemon-0.2.0.pkg
+pkg install ./beastiemon-0.4.0.pkg
 sysrc beastied_enable=YES
 service beastied start
 ```
@@ -114,6 +114,7 @@ This produces `dist/freebsd-amd64/beastied` and `dist/freebsd-amd64/beastie`.
 | Target               | What it does |
 |----------------------|--------------|
 | `gmake all`          | `deps + vendor-js + build` (default) |
+| `gmake deps`         | `go mod download` + `go mod tidy` |
 | `gmake build`        | Cross-compile both binaries into `dist/<goos>-<goarch>/` (defaults `GOOS=freebsd GOARCH=amd64`) |
 | `gmake build-native` | Compile for the current host (handy on Linux dev boxes) |
 | `gmake dist`         | Build and package every architecture in `ARCHES`, with a `SHA256SUMS` manifest |
@@ -146,7 +147,7 @@ Override `VERSION`, `PREFIX`, `GOOS`, `GOARCH`, `ABI`, `ARCHES` or `DESTDIR`
 on the command line:
 
 ```sh
-gmake VERSION=0.3.0 GOARCH=arm64 ABI=FreeBSD:15:aarch64 pkg
+gmake VERSION=0.5.0 GOARCH=arm64 ABI=FreeBSD:15:aarch64 pkg
 gmake ABI_VERSION=14 pkg            # a package for FreeBSD 14
 gmake PREFIX=/opt/beastiemon DESTDIR=/tmp/root install
 ```
@@ -155,7 +156,7 @@ gmake PREFIX=/opt/beastiemon DESTDIR=/tmp/root install
 
 ```sh
 gmake run
-# beastied 0.2.0 listening on 127.0.0.1:8088
+# beastied 0.4.0 listening on 127.0.0.1:8088
 ```
 
 The binary stays in the foreground; `Ctrl-C` to stop. Web assets are
@@ -167,8 +168,8 @@ serving needed.
 ## Building a FreeBSD Package
 
 ```sh
-gmake VERSION=0.2.0 pkg
-# .pkg/beastiemon-0.2.0.pkg
+gmake VERSION=0.4.0 pkg
+# .pkg/beastiemon-0.4.0.pkg
 ```
 
 This works **on any build host**, FreeBSD or not. Where `pkg(8)` is present
@@ -185,8 +186,8 @@ labelled aarch64 package:
 
 ```sh
 gmake dist
-# .pkg/beastiemon-0.2.0-amd64.pkg
-# .pkg/beastiemon-0.2.0-aarch64.pkg
+# .pkg/beastiemon-0.4.0-amd64.pkg
+# .pkg/beastiemon-0.4.0-aarch64.pkg
 # .pkg/SHA256SUMS
 ```
 
@@ -215,7 +216,7 @@ uPlot embedded (no CDN at runtime) without touching your checkout.
 Inspect before installing:
 
 ```sh
-pkg info -F .pkg/beastiemon-0.2.0.pkg
+pkg info -F .pkg/beastiemon-0.4.0.pkg
 ```
 
 ---
@@ -225,7 +226,7 @@ pkg info -F .pkg/beastiemon-0.2.0.pkg
 ### From the built package
 
 ```sh
-pkg install ./.pkg/beastiemon-0.2.0.pkg
+pkg install ./.pkg/beastiemon-0.4.0.pkg
 ```
 
 The package install does the following automatically:
@@ -265,7 +266,10 @@ The config file lives at **`/usr/local/etc/beastiemon.conf`** (TOML).
 listen = "127.0.0.1:8088"
 
 [collect]
-# Sample interval. Any Go duration: "500ms", "1s", "5s".
+# Sample interval. Any Go duration: "500ms", "1s", "5s". Sub-second values
+# keep their resolution end to end — /api/series timestamps carry the fraction
+# — but every tick costs a full collection pass, and with the ZFS/jail/pf
+# panels on that means shelling out that often.
 interval = "1s"
 
 # Seconds of 1-second-resolution history to keep in RAM.
@@ -563,7 +567,7 @@ $ beastie
 <----.     '__\
 <----|====O)))==)
 <----'    `--'
-    BeastieMon v0.2.0  — FreeBSD system monitor
+    BeastieMon v0.4.0  — FreeBSD system monitor
 
 Host: monitor.local  OS: freebsd 14.0-RELEASE
 
@@ -1033,32 +1037,46 @@ pfctl -f /etc/pf.conf
 
 ```nginx
 # /usr/local/etc/nginx/nginx.conf
-server {
-    listen 443 ssl http2;
-    server_name monitor.example.org;
+http {
+    # /api/ws is a WebSocket, and nginx only forwards the upgrade when it is
+    # told to. Without this map and the two headers below it, the dashboard's
+    # SSE stream still works and /api/ws answers 400 to every client.
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
 
-    ssl_certificate     /usr/local/etc/letsencrypt/live/monitor/fullchain.pem;
-    ssl_certificate_key /usr/local/etc/letsencrypt/live/monitor/privkey.pem;
+    server {
+        listen 443 ssl;
+        http2 on;
+        server_name monitor.example.org;
 
-    auth_basic           "BeastieMon";
-    auth_basic_user_file /usr/local/etc/nginx/htpasswd;
+        ssl_certificate     /usr/local/etc/letsencrypt/live/monitor/fullchain.pem;
+        ssl_certificate_key /usr/local/etc/letsencrypt/live/monitor/privkey.pem;
 
-    location / {
-        proxy_pass         http://127.0.0.1:8088;
-        proxy_http_version 1.1;
-        proxy_buffering    off;       # SSE needs streaming
-        proxy_read_timeout 1h;        # SSE long-lived connections
-        proxy_set_header   Host       $host;
-        proxy_set_header   X-Real-IP  $remote_addr;
+        auth_basic           "BeastieMon";
+        auth_basic_user_file /usr/local/etc/nginx/htpasswd;
+
+        location / {
+            proxy_pass         http://127.0.0.1:8088;
+            proxy_http_version 1.1;
+            proxy_buffering    off;       # SSE needs streaming
+            proxy_read_timeout 1h;        # SSE long-lived connections
+            proxy_set_header   Host       $host;
+            proxy_set_header   X-Real-IP  $remote_addr;
+            proxy_set_header   Upgrade    $http_upgrade;
+            proxy_set_header   Connection $connection_upgrade;
+        }
     }
 }
 ```
 
-Create the htpasswd file:
+Create the htpasswd file. FreeBSD has no `apache24-utils` package, and pulling
+in all of `apache24` for one command is a poor trade next to nginx — openssl is
+in the base system and writes the same format:
 
 ```sh
-pkg install apache24-utils   # provides htpasswd(1)
-htpasswd -c /usr/local/etc/nginx/htpasswd admin
+printf 'admin:%s\n' "$(openssl passwd -apr1)" > /usr/local/etc/nginx/htpasswd
 chown root:www /usr/local/etc/nginx/htpasswd
 chmod 0640 /usr/local/etc/nginx/htpasswd
 ```
@@ -1176,6 +1194,26 @@ the rule as **firing** because the rule *is* firing; only the notification is
 lost. Rules whose POSTs all fail still record their events, so `/api/alerts`
 and the Alerts card are not evidence that anyone was paged.
 
+### History stops being written
+
+`[store]` is optional, so a store that cannot write degrades rather than taking
+the daemon down — but it says so. A full filesystem, a database turned
+read-only, a directory whose ownership changed: all of them look like this,
+and the daemon keeps serving metrics throughout.
+
+```sh
+$ tail /var/log/beastied.log
+store: writing a history row failed: database or disk is full (13) —
+  history is not being saved
+store: writing a history row is working again
+```
+
+The line repeats at most once a minute while the problem lasts (a full disk
+fails on every sample), and one more line marks the recovery. Until then
+`/api/series` quietly answers long ranges from the in-memory ring alone, and
+alert events stop surviving restarts — the startup line still says `store on`,
+because the store is configured and open; it is the writes that are failing.
+
 ### A rule stays "unknown" forever
 
 The metric can't be read: a mount that isn't mounted, a host with no
@@ -1260,7 +1298,8 @@ but everything else is portable. On Linux:
 
 ```sh
 gmake build-native
-./beastied -config freebsd/beastiemon.conf
+./dist/linux-amd64/beastied -config freebsd/beastiemon.conf
+# or just: gmake run
 ```
 
 Disk, network, filesystem, CPU, memory, and process metrics use

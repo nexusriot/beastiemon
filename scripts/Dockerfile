@@ -13,7 +13,7 @@
 FROM golang:1.23-bookworm AS build
 
 # Mirrors of the Makefile's knobs, passed through by the pkg-docker target.
-ARG VERSION=0.2.0
+ARG VERSION=0.4.0
 ARG GOOS=freebsd
 ARG GOARCH=amd64
 ARG ABI=FreeBSD:15:amd64

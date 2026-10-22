@@ -571,3 +571,39 @@ func readSSE(t *testing.T, r interface{ Read([]byte) (int, error) }, want int, w
 	}
 	return frames
 }
+
+// The sample config offers interval = "500ms", and the whole point of a
+// sub-second interval is finer resolution. The series timestamp column used
+// to be whole seconds, so every sample inside one second collided: uPlot
+// binary-searches that column, and the dashboard drops any live point that
+// does not advance it, so the extra samples were collected and then thrown
+// away on the way to the chart.
+func TestSubSecondIntervalKeepsItsResolution(t *testing.T) {
+	cfg := strings.Replace(baseConfig(), `interval = "200ms"`, `interval = "250ms"`, 1)
+	d := startDaemon(t, cfg)
+	d.waitSample()
+	time.Sleep(2 * time.Second) // ~8 samples, spanning at least two seconds
+
+	var s series
+	d.getJSON("/api/series?metric=cpu&range=5m&cores=0", &s)
+	ts := s.Data[0]
+	if len(ts) < 5 {
+		t.Fatalf("only %d samples after 2s at 250ms", len(ts))
+	}
+	for i := 1; i < len(ts); i++ {
+		if ts[i] <= ts[i-1] {
+			t.Fatalf("timestamps must strictly increase: ts[%d]=%v <= ts[%d]=%v",
+				i, ts[i], i-1, ts[i-1])
+		}
+	}
+	// More than one sample per second has to survive, or the interval setting
+	// bought nothing.
+	span := ts[len(ts)-1] - ts[0]
+	if span <= 0 {
+		t.Fatalf("the window spans no time at all: %v", ts)
+	}
+	if rate := float64(len(ts)-1) / span; rate < 2 {
+		t.Errorf("%.1f samples per second over %.2fs, want ~4 at a 250ms interval",
+			rate, span)
+	}
+}

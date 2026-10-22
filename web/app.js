@@ -281,9 +281,12 @@ function applyLiveSnap(snap) {
   // seeded history is re-fetched by loadAll() anyway.
   if (state.paused) return;
   state.latestSnap = snap;
-  // Whole seconds, matching the integer Unix timestamps /api/series returns,
-  // so seeded history and live points share one grid.
-  const ts = Math.floor(new Date(snap.ts).getTime() / 1000);
+  // Seconds with the fraction kept, matching the timestamps /api/series
+  // returns, so seeded history and live points share one grid. Flooring here
+  // would make every sample inside one second collide, and appendToChart
+  // drops anything that does not advance the timeline — at interval = "500ms"
+  // that silently threw away every other live point.
+  const ts = new Date(snap.ts).getTime() / 1000;
 
   // CPU summary
   const cpuPct = snap.cpu?.total ?? 0;

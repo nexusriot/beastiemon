@@ -1,9 +1,11 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -374,5 +376,141 @@ func TestOpenSQLiteExplainsUnusableDirectory(t *testing.T) {
 			t.Fatalf("a writable directory should open: %v", err)
 		}
 		s.Close()
+	})
+}
+
+// A store that cannot write is invisible from everywhere else: the daemon
+// still logs "store on", /api/series still answers from the ring, and the
+// rows simply stop arriving. A full filesystem does this on every sample, so
+// the reporting has to be rate-limited — a line per second would bury the log
+// and keep writing to the filesystem that just filled up.
+func TestStoreReportsPersistenceFailures(t *testing.T) {
+	t.Run("a failed write is reported", func(t *testing.T) {
+		s, err := OpenSQLite(filepath.Join(t.TempDir(), "history.db"), Options{
+			Resolution: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		// Wait for the writer's opening maintenance pass, so the only
+		// failures that follow come from the sample writes themselves.
+		<-s.ready
+
+		type report struct {
+			op  string
+			err error
+		}
+		got := make(chan report, 32)
+		s.SetErrorFunc(func(op string, err error) { got <- report{op, err} })
+
+		// Closing the handle makes every statement fail the way a full disk
+		// or a revoked permission does, without needing either.
+		s.db.Close()
+
+		base := time.Now().Truncate(time.Second)
+		s.Push(snapAt(base, 10))
+		s.Push(snapAt(base.Add(time.Second), 20))
+
+		// Look for the row write specifically: pruning also mentions history,
+		// and a report from it would not prove the sample path is covered.
+		const want = "writing a history row"
+		deadline := time.After(5 * time.Second)
+		for {
+			select {
+			case r := <-got:
+				if r.op != want {
+					continue
+				}
+				if r.err == nil {
+					t.Errorf("a failed write should report an error, got %+v", r)
+				}
+				return
+			case <-deadline:
+				t.Fatalf("a failed sample write was never reported as %q", want)
+			}
+		}
+	})
+
+	t.Run("repeats are rate-limited and recovery is reported once", func(t *testing.T) {
+		s, err := OpenSQLite(filepath.Join(t.TempDir(), "history.db"), Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		var mu sync.Mutex
+		var fails, recoveries int
+		s.SetErrorFunc(func(_ string, err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				recoveries++
+			} else {
+				fails++
+			}
+		})
+
+		boom := errors.New("disk full")
+		for i := 0; i < 50; i++ {
+			s.note("writing a history row", boom)
+		}
+		mu.Lock()
+		gotFails := fails
+		mu.Unlock()
+		if gotFails != 1 {
+			t.Errorf("50 consecutive failures produced %d reports, want 1", gotFails)
+		}
+
+		// Still failing, but long enough ago to be worth saying again.
+		s.errMu.Lock()
+		s.lastReport = time.Now().Add(-2 * errorReportEvery)
+		s.errMu.Unlock()
+		s.note("writing a history row", boom)
+		mu.Lock()
+		gotFails = fails
+		mu.Unlock()
+		if gotFails != 2 {
+			t.Errorf("a failure past the interval produced %d reports, want 2", gotFails)
+		}
+
+		// Writes working again is worth exactly one line, not one per sample.
+		for i := 0; i < 10; i++ {
+			s.note("writing a history row", nil)
+		}
+		mu.Lock()
+		gotRecoveries := recoveries
+		mu.Unlock()
+		if gotRecoveries != 1 {
+			t.Errorf("recovery produced %d reports, want 1", gotRecoveries)
+		}
+	})
+
+	t.Run("a healthy store stays quiet", func(t *testing.T) {
+		s, err := OpenSQLite(filepath.Join(t.TempDir(), "history.db"), Options{
+			Resolution: time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		var mu sync.Mutex
+		var reports int
+		s.SetErrorFunc(func(string, error) { mu.Lock(); reports++; mu.Unlock() })
+
+		base := time.Now().Truncate(time.Second)
+		for i := 0; i < 5; i++ {
+			s.Push(snapAt(base.Add(time.Duration(i)*time.Second), float64(i)))
+		}
+		s.Since(base.Add(-time.Hour))
+		time.Sleep(300 * time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if reports != 0 {
+			t.Errorf("a working store reported %d problems", reports)
+		}
 	})
 }

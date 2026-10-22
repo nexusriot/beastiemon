@@ -604,11 +604,20 @@ func wantCores(q url.Values) bool {
 	return true
 }
 
-// timestamps returns the unix-second timestamp column shared by every series.
+// timestamps returns the timestamp column shared by every series, in seconds
+// since the epoch with the sub-second part kept.
+//
+// Whole seconds would be enough for the default interval, but [collect]
+// interval accepts sub-second durations ("500ms" is in the sample config), and
+// truncating made every sample inside the same second share an x value. uPlot
+// binary-searches that column, so the chart could only ever show one point per
+// second — the extra resolution was collected, stored and then dropped on the
+// way to the screen. Store rows are keyed by whole seconds and come back with
+// a zero fraction, so they are unaffected.
 func timestamps(snaps []collect.Snapshot) []float64 {
 	ts := make([]float64, len(snaps))
 	for i, s := range snaps {
-		ts[i] = float64(s.Time.Unix())
+		ts[i] = float64(s.Time.UnixNano()) / 1e9
 	}
 	return ts
 }

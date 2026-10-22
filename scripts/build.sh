@@ -18,7 +18,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
-VERSION=${VERSION:-0.2.0}
+VERSION=${VERSION:-0.4.0}
 GOOS=${GOOS:-$(go env GOHOSTOS)}
 GOARCH=${GOARCH:-$(go env GOHOSTARCH)}
 OUT=${OUT:-dist/${GOOS}-${GOARCH}}

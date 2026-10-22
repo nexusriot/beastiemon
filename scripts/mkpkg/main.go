@@ -17,8 +17,8 @@
 // Usage:
 //
 //	go run ./scripts/mkpkg -stage .stage -manifest freebsd/+MANIFEST \
-//	    -version 0.2.0 -abi FreeBSD:15:amd64 -arch freebsd:15:x86:64 \
-//	    -out .pkg/beastiemon-0.2.0.pkg
+//	    -version 0.4.0 -abi FreeBSD:15:amd64 -arch freebsd:15:x86:64 \
+//	    -out .pkg/beastiemon-0.4.0.pkg
 package main
 
 import (

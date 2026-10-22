@@ -3,7 +3,7 @@
 # Build every shipped architecture and package each one.
 #
 #   scripts/release.sh                      # freebsd/amd64 + freebsd/arm64
-#   ARCHES="amd64" VERSION=0.3.0 scripts/release.sh
+#   ARCHES="amd64" VERSION=0.5.0 scripts/release.sh
 #
 # Leaves binaries under dist/<goos>-<goarch>/ and packages in .pkg/, with a
 # SHA256 manifest beside them.
@@ -12,7 +12,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
-VERSION=${VERSION:-0.2.0}
+VERSION=${VERSION:-0.4.0}
 GOOS=${GOOS:-freebsd}
 ARCHES=${ARCHES:-amd64 arm64}
 ABI_VERSION=${ABI_VERSION:-15}

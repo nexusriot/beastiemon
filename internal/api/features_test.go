@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -13,7 +14,14 @@ import (
 	"github.com/nexusriot/beastiemon/internal/alert"
 	"github.com/nexusriot/beastiemon/internal/collect"
 	"github.com/nexusriot/beastiemon/internal/config"
+	"github.com/nexusriot/beastiemon/internal/store"
 )
+
+// deepServer is testServer with a ring big enough to hold a whole test's
+// worth of samples; the shared one keeps only four.
+func deepServer(n int) *Server {
+	return New(store.NewRing(n), fstest.MapFS{}, config.AuthConfig{})
+}
 
 func sampleSnap(t time.Time) collect.Snapshot {
 	return collect.Snapshot{
@@ -536,5 +544,114 @@ func TestParseDurationClampsHugeSecondValues(t *testing.T) {
 	}
 	if got := parseDuration("nonsense", def); got != def {
 		t.Errorf("parseDuration(\"nonsense\") = %v, want the default %v", got, def)
+	}
+}
+
+// [collect] interval accepts sub-second durations — "500ms" is in the sample
+// config — but the series timestamp column used to be whole seconds, so every
+// sample inside the same second shared an x value. uPlot binary-searches that
+// column and the dashboard drops any point that does not advance it, so the
+// extra resolution was collected and then thrown away on the way to the chart.
+func TestSeriesTimestampsKeepSubSecondResolution(t *testing.T) {
+	s := deepServer(600)
+	// Relative to now, so the samples fall inside the range window.
+	base := time.Now().Truncate(time.Second).Add(-5 * time.Second)
+	// Ten samples 200ms apart: five pairs that would collide at second
+	// precision.
+	for i := 0; i < 10; i++ {
+		snap := sampleSnap(base.Add(time.Duration(i) * 200 * time.Millisecond))
+		snap.CPU.Total = float64(i)
+		s.Ingest(snap)
+	}
+
+	rec := get(s, "/api/series?metric=cpu&range=1h&cores=0", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	var resp struct {
+		Labels []string    `json:"labels"`
+		Data   [][]float64 `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	ts := resp.Data[0]
+	if len(ts) != 10 {
+		t.Fatalf("got %d points, want the 10 ingested", len(ts))
+	}
+	for i := 1; i < len(ts); i++ {
+		if ts[i] <= ts[i-1] {
+			t.Fatalf("timestamps must strictly increase for uPlot: ts[%d]=%v <= ts[%d]=%v\n%v",
+				i, ts[i], i-1, ts[i-1], ts)
+		}
+	}
+	// Still seconds since the epoch, with the fraction kept.
+	if want := float64(base.Unix()); ts[0] != want {
+		t.Errorf("first timestamp = %v, want %v", ts[0], want)
+	}
+	if want := float64(base.Unix()) + 0.2; ts[1] < want-1e-6 || ts[1] > want+1e-6 {
+		t.Errorf("second timestamp = %v, want %v", ts[1], want)
+	}
+}
+
+// Whole-second samples — which is everything the SQLite store hands back,
+// since its rows are keyed by second — must stay exactly integral.
+func TestSeriesTimestampsStayIntegralForWholeSeconds(t *testing.T) {
+	s := deepServer(600)
+	base := time.Now().Truncate(time.Second).Add(-10 * time.Second)
+	for i := 0; i < 5; i++ {
+		s.Ingest(sampleSnap(base.Add(time.Duration(i) * time.Second)))
+	}
+
+	rec := get(s, "/api/series?metric=cpu&range=1h&cores=0", nil)
+	var resp struct {
+		Data [][]float64 `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data[0]) != 5 {
+		t.Fatalf("got %d points, want the 5 ingested", len(resp.Data[0]))
+	}
+	for i, v := range resp.Data[0] {
+		if v != float64(int64(v)) {
+			t.Errorf("ts[%d] = %v, want a whole second", i, v)
+		}
+	}
+}
+
+// A backward clock step leaves the ring holding later-stamped samples ahead of
+// earlier ones, and the series column is what uPlot binary-searches. The
+// column has to come out ordered however the samples arrived.
+func TestSeriesTimestampsSurviveABackwardClockStep(t *testing.T) {
+	s := deepServer(600)
+	now := time.Now().Truncate(time.Second)
+
+	// Three samples, then the clock steps a minute back, then three more.
+	for i := 0; i < 3; i++ {
+		s.Ingest(sampleSnap(now.Add(time.Duration(i) * time.Second)))
+	}
+	stepped := now.Add(-time.Minute)
+	for i := 0; i < 3; i++ {
+		s.Ingest(sampleSnap(stepped.Add(time.Duration(i) * time.Second)))
+	}
+
+	rec := get(s, "/api/series?metric=cpu&range=1h&cores=0", nil)
+	var resp struct {
+		Data [][]float64 `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ts := resp.Data[0]
+	if len(ts) != 6 {
+		t.Fatalf("got %d points, want all 6 ingested", len(ts))
+	}
+	for i := 1; i < len(ts); i++ {
+		if ts[i] < ts[i-1] {
+			t.Fatalf("timestamps went backwards at %d: %v then %v\n%v",
+				i, ts[i-1], ts[i], ts)
+		}
 	}
 }

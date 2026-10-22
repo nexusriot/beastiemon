@@ -25,25 +25,53 @@ import (
 // so the Snapshot struct can grow without a schema migration.
 //
 // Writes happen on a single background goroutine fed by a buffered channel, so
+// errorReportEvery bounds how often an ongoing persistence failure is
+// reported. A filesystem with no room left fails every single write, and a log
+// line per sample would both bury everything else and keep writing to the
+// filesystem that just filled up.
+const errorReportEvery = time.Minute
 
-// explainOpen replaces the driver's error when the real problem is a history
-// directory the daemon user cannot write. SQLite answers that with "unable to
-// open database file: out of memory (14)", which sends an operator hunting a
-// memory leak that isn't there — and it is the single most likely store
-// misconfiguration, since beastied runs as _beastie while /var/db is root's.
-// Only the probe's own failure is reported, so a genuine driver error is never
-// masked.
-func explainOpen(path string, err error) error {
-	dir := filepath.Dir(path)
-	probe, perr := os.CreateTemp(dir, ".beastiemon-probe-*")
-	if perr == nil {
-		name := probe.Name()
-		probe.Close()
-		os.Remove(name)
-		return err
+// SetErrorFunc registers a callback for persistence failures — a full disk, a
+// database turned read-only, a revoked permission. Without one the store fails
+// in complete silence: the daemon still logs "store on" at startup,
+// /api/series still answers from the ring, and nothing anywhere says that
+// history (and, with it, alert events that are supposed to survive restarts)
+// stopped being written. Nothing under internal/ logs, so the daemon supplies
+// the sink.
+//
+// The callback is invoked with the failing operation and the error, at most
+// once per errorReportEvery while a failure persists, and once more with a nil
+// error when writes start working again.
+func (s *SQLite) SetErrorFunc(fn func(op string, err error)) {
+	s.errMu.Lock()
+	s.onError = fn
+	s.errMu.Unlock()
+}
+
+// note records the outcome of one persistence operation, reporting state
+// changes rather than every attempt.
+func (s *SQLite) note(op string, err error) {
+	s.errMu.Lock()
+	fn := s.onError
+	now := time.Now()
+	var report, recovered bool
+	switch {
+	case err != nil && (!s.failing || now.Sub(s.lastReport) >= errorReportEvery):
+		s.failing, s.lastReport, report = true, now, true
+	case err == nil && s.failing:
+		s.failing, recovered = false, true
 	}
-	return fmt.Errorf("history directory %s is not writable by the daemon user "+
-		"(%v); chown it to the user beastied runs as: %w", dir, perr, err)
+	s.errMu.Unlock()
+
+	if fn == nil {
+		return
+	}
+	switch {
+	case report:
+		fn(op, err)
+	case recovered:
+		fn(op, nil)
+	}
 }
 
 // Push never blocks the sampler's hot path (it drops if the writer is backed
@@ -65,6 +93,14 @@ type SQLite struct {
 	mu  sync.Mutex
 	agg *bucketAgg // the bucket currently accumulating (nil until first sample)
 
+	// errMu guards the persistence-failure reporting below. It is separate
+	// from mu because writeRow is called holding mu while SaveAlertEvent is
+	// not, and both report through the same path.
+	errMu      sync.Mutex
+	onError    func(op string, err error)
+	failing    bool
+	lastReport time.Time
+
 	ch     chan collect.Snapshot
 	done   chan struct{}
 	closed chan struct{}
@@ -83,6 +119,26 @@ type Options struct {
 	// ones. 0 disables the tier.
 	CoarseAfter      time.Duration
 	CoarseResolution time.Duration
+}
+
+// explainOpen replaces the driver's error when the real problem is a history
+// directory the daemon user cannot write. SQLite answers that with "unable to
+// open database file: out of memory (14)", which sends an operator hunting a
+// memory leak that isn't there — and it is the single most likely store
+// misconfiguration, since beastied runs as _beastie while /var/db is root's.
+// Only the probe's own failure is reported, so a genuine driver error is never
+// masked.
+func explainOpen(path string, err error) error {
+	dir := filepath.Dir(path)
+	probe, perr := os.CreateTemp(dir, ".beastiemon-probe-*")
+	if perr == nil {
+		name := probe.Name()
+		probe.Close()
+		os.Remove(name)
+		return err
+	}
+	return fmt.Errorf("history directory %s is not writable by the daemon user "+
+		"(%v); chown it to the user beastied runs as: %w", dir, perr, err)
 }
 
 // OpenSQLite opens (creating parent dirs and the tables if needed) the history
@@ -163,6 +219,7 @@ func (s *SQLite) Push(snap collect.Snapshot) {
 // oldest first.
 func (s *SQLite) Since(t time.Time) []collect.Snapshot {
 	rows, err := s.db.Query(`SELECT data FROM samples WHERE ts >= ? ORDER BY ts ASC`, t.Unix())
+	s.note("reading history", err)
 	if err != nil {
 		return nil
 	}
@@ -420,24 +477,28 @@ func (s *SQLite) writeRow(a *bucketAgg) {
 	}
 	ld, _ := json.Marshal(lo)
 	hd, _ := json.Marshal(hi)
-	s.db.Exec(`INSERT OR REPLACE INTO samples(ts, data, dmin, dmax) VALUES(?, ?, ?, ?)`,
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO samples(ts, data, dmin, dmax) VALUES(?, ?, ?, ?)`,
 		avg.Time.Unix(), string(ad), string(ld), string(hd))
+	s.note("writing a history row", err)
 }
 
 // prune deletes rows older than the retention window; alert events age out on
 // the same schedule.
 func (s *SQLite) prune() {
 	cutoff := time.Now().Add(-s.retention).Unix()
-	s.db.Exec(`DELETE FROM samples WHERE ts < ?`, cutoff)
-	s.db.Exec(`DELETE FROM alert_events WHERE ts < ?`, cutoff)
+	_, err := s.db.Exec(`DELETE FROM samples WHERE ts < ?`, cutoff)
+	s.note("pruning history past the retention window", err)
+	_, err = s.db.Exec(`DELETE FROM alert_events WHERE ts < ?`, cutoff)
+	s.note("pruning alert events past the retention window", err)
 }
 
 // SaveAlertEvent persists one alert event as raw JSON. Events are rare, so
 // this writes synchronously; the single-connection pool serialises it against
 // the sampler writer.
 func (s *SQLite) SaveAlertEvent(ts time.Time, rule, state string, data []byte) {
-	s.db.Exec(`INSERT INTO alert_events(ts, rule, state, data) VALUES(?, ?, ?, ?)`,
+	_, err := s.db.Exec(`INSERT INTO alert_events(ts, rule, state, data) VALUES(?, ?, ?, ?)`,
 		ts.Unix(), rule, state, string(data))
+	s.note("persisting an alert event", err)
 }
 
 // AlertEvents returns up to limit persisted alert events as raw JSON, newest

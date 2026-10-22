@@ -3,7 +3,7 @@
 # Build the FreeBSD package from a staged tree (scripts/stage.sh).
 #
 #   scripts/mkpkg.sh
-#   VERSION=0.3.0 ABI=FreeBSD:14:amd64 scripts/mkpkg.sh
+#   VERSION=0.5.0 ABI=FreeBSD:14:amd64 scripts/mkpkg.sh
 #
 # Uses pkg(8) when the build host has it — that is the canonical tool, and it
 # fills in per-file checksums and the +COMPACT_MANIFEST a repository catalogue
@@ -15,7 +15,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
-VERSION=${VERSION:-0.2.0}
+VERSION=${VERSION:-0.4.0}
 STAGE=${STAGE:-$ROOT/.stage}
 PKGDIR=${PKGDIR:-$ROOT/.pkg}
 ABI=${ABI:-FreeBSD:15:amd64}

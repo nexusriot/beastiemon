@@ -22,7 +22,7 @@ import (
 	bweb "github.com/nexusriot/beastiemon/web"
 )
 
-var version = "0.2.0"
+var version = "0.4.0"
 
 func main() {
 	cfgPath := flag.String("config", "/usr/local/etc/beastiemon.conf", "config file path")
@@ -65,6 +65,15 @@ func main() {
 		if err != nil {
 			log.Fatalf("store: %v", err)
 		}
+		// A store that cannot write is invisible otherwise: the startup line
+		// still says "store on" and /api/series still answers from the ring.
+		hist.SetErrorFunc(func(op string, err error) {
+			if err == nil {
+				log.Printf("store: %s is working again", op)
+				return
+			}
+			log.Printf("store: %s failed: %v — history is not being saved", op, err)
+		})
 		srv.SetStore(hist)
 		defer hist.Close()
 	}
