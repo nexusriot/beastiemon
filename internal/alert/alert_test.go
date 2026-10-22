@@ -434,3 +434,139 @@ func TestValidateMatchesMetricValue(t *testing.T) {
 		}
 	}
 }
+
+// The watchdog is reported through the same RuleStatus shape as a real rule,
+// so a client reading /api/alerts should not find it firing with a zero
+// last_fire — that pairing reads as "fired at year one" and breaks any glue
+// that sorts or ages events by it.
+func TestWatchdogStatusCarriesLastFire(t *testing.T) {
+	cfg := config.AlertsConfig{
+		Webhook:    "http://h",
+		StaleAfter: config.Duration{Duration: 30 * time.Second},
+	}
+	e := New(cfg)
+	e.post = func(_, _ string, _ Event) {}
+
+	base := time.Now()
+	e.lastSnap = base
+
+	fired := base.Add(31 * time.Second)
+	e.CheckStale(fired)
+
+	wd := watchdogStatus(t, e)
+	if wd.State != "firing" {
+		t.Fatalf("want the watchdog firing, got %q", wd.State)
+	}
+	if !wd.LastFire.Equal(fired) {
+		t.Errorf("last_fire = %v, want the firing time %v", wd.LastFire, fired)
+	}
+	if wd.LastFire.IsZero() {
+		t.Error("a firing watchdog must not report a zero last_fire")
+	}
+
+	// Before it ever fires there is nothing to report, matching a quiet rule.
+	quiet := New(cfg)
+	quiet.post = func(_, _ string, _ Event) {}
+	quiet.lastSnap = base
+	if got := watchdogStatus(t, quiet); !got.LastFire.IsZero() {
+		t.Errorf("a watchdog that never fired should have no last_fire, got %v", got.LastFire)
+	}
+}
+
+func watchdogStatus(t *testing.T, e *Engine) RuleStatus {
+	t.Helper()
+	for _, st := range e.States() {
+		if st.Name == "watchdog" {
+			return st
+		}
+	}
+	t.Fatal("no watchdog in States()")
+	return RuleStatus{}
+}
+
+// A webhook that never lands is invisible from inside the daemon: the rule
+// still reads "firing" in /api/alerts and the event is still recorded, so
+// alerting looks healthy while nothing is delivered. The engine reports the
+// failure so the daemon can log it.
+func TestWebhookDeliveryFailureIsReported(t *testing.T) {
+	type failure struct {
+		rule string
+		url  string
+		err  error
+	}
+
+	t.Run("non-2xx reply", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "nope", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		got := make(chan failure, 4)
+		e := New(config.AlertsConfig{Webhook: srv.URL, Rules: []config.AlertRule{
+			{Name: "r", Metric: "cpu", Field: "total", Op: ">", Threshold: 1},
+		}})
+		e.SetDeliveryErrorFunc(func(ev Event, url string, err error) {
+			got <- failure{ev.Rule, url, err}
+		})
+		e.Eval(cpuSnap(time.Now(), 50))
+
+		select {
+		case f := <-got:
+			if f.rule != "r" || f.url != srv.URL {
+				t.Errorf("report should name the rule and endpoint, got %+v", f)
+			}
+			if f.err == nil || !strings.Contains(f.err.Error(), "500") {
+				t.Errorf("error should carry the status, got %v", f.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a 500 reply was not reported")
+		}
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		// A listener that is closed straight away gives a port nothing answers.
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		dead := srv.URL
+		srv.Close()
+
+		got := make(chan failure, 4)
+		e := New(config.AlertsConfig{Webhook: dead, Rules: []config.AlertRule{
+			{Name: "gone", Metric: "cpu", Field: "total", Op: ">", Threshold: 1},
+		}})
+		e.SetDeliveryErrorFunc(func(ev Event, url string, err error) {
+			got <- failure{ev.Rule, url, err}
+		})
+		e.Eval(cpuSnap(time.Now(), 50))
+
+		select {
+		case f := <-got:
+			if f.rule != "gone" || f.err == nil {
+				t.Errorf("unreachable endpoint should be reported, got %+v", f)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("an unreachable endpoint was not reported")
+		}
+	})
+
+	t.Run("success stays quiet", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent) // 204 is a fine acknowledgement
+		}))
+		defer srv.Close()
+
+		got := make(chan failure, 4)
+		e := New(config.AlertsConfig{Webhook: srv.URL, Rules: []config.AlertRule{
+			{Name: "ok", Metric: "cpu", Field: "total", Op: ">", Threshold: 1},
+		}})
+		e.SetDeliveryErrorFunc(func(ev Event, url string, err error) {
+			got <- failure{ev.Rule, url, err}
+		})
+		e.Eval(cpuSnap(time.Now(), 50))
+
+		select {
+		case f := <-got:
+			t.Errorf("a delivered webhook must not be reported as failed: %+v", f)
+		case <-time.After(1500 * time.Millisecond):
+		}
+	})
+}

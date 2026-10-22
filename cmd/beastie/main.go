@@ -477,15 +477,81 @@ func collectOnce(cfg config.Config) (collect.Snapshot, bool) {
 // snapshotFn produces one snapshot: local sampling or a remote daemon fetch.
 type snapshotFn func() (collect.Snapshot, error)
 
-// mustSnap runs get for the human-facing commands: on failure it still
-// returns the (empty) snapshot but warns on stderr instead of printing
-// all-zero metrics as if they were real.
+// osExit is os.Exit, indirected so tests can observe the exit status of the
+// paths that end the process.
+var osExit = os.Exit
+
+// mustSnap runs get for the one-shot commands. A snapshot that could not be
+// taken has nothing honest to print, so it warns and exits non-zero rather
+// than rendering all-zero metrics — or, under --json, a zero-filled object —
+// that a script would read as a healthy host. This is the plain-command
+// counterpart of check mode's UNKNOWN/3 for the same failure.
 func mustSnap(get snapshotFn) collect.Snapshot {
 	snap, err := get()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "beastie: %v; output may be empty\n", err)
+		fmt.Fprintf(os.Stderr, "beastie: %v\n", err)
+		osExit(1)
 	}
 	return snap
+}
+
+// pollSnap is mustSnap's counterpart for the continuous `top` view, where one
+// failed sample should cost a frame rather than the whole session: it reports
+// the failure and lets the caller skip that repaint.
+func pollSnap(get snapshotFn) (collect.Snapshot, bool) {
+	snap, err := get()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "beastie: %v\n", err)
+		return snap, false
+	}
+	return snap, true
+}
+
+// dialable turns server.listen — a *bind* address — into one a client can
+// connect to. A wildcard bind ("0.0.0.0:8088", ":8088", "[::]:8088") names
+// every local interface rather than a reachable peer, and connecting to it
+// fails outright on FreeBSD ("network is unreachable"). Since "auto" means
+// "the daemon whose config I just read", loopback is where it answers. The
+// README tells LAN installs to bind 0.0.0.0, so --remote auto has to handle
+// exactly that value. Socket paths and real hosts pass through untouched.
+func dialable(listen string) string {
+	if strings.HasPrefix(listen, "/") {
+		return listen
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
+	}
+	switch host {
+	case "", "0.0.0.0":
+		return net.JoinHostPort("127.0.0.1", port)
+	case "::":
+		return net.JoinHostPort("::1", port)
+	}
+	return listen
+}
+
+// trailingArgs returns whatever follows the command. flag.Args() is empty when
+// no command was given at all — plain `beastie`, which defaults to status — so
+// the slice cannot be taken blindly.
+func trailingArgs(args []string) []string {
+	if len(args) < 2 {
+		return nil
+	}
+	return args[1:]
+}
+
+// flagLikeArgs picks out the arguments that look like flags, used to catch
+// `beastie cpu --json` — the ordering the usage text warns about, which the
+// flag package drops without a word.
+func flagLikeArgs(args []string) []string {
+	var bad []string
+	for _, a := range args {
+		if len(a) > 1 && strings.HasPrefix(a, "-") {
+			bad = append(bad, a)
+		}
+	}
+	return bad
 }
 
 // remoteBase resolves the -remote flag value to an HTTP client and base URL.
@@ -497,6 +563,7 @@ func remoteBase(cfg config.Config, target string) (*http.Client, string, error) 
 		if target == "" {
 			return nil, "", errors.New("remote auto: no server.listen in config")
 		}
+		target = dialable(target)
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
 	switch {
@@ -952,7 +1019,7 @@ func main() {
 			// Stream one compact JSON snapshot per interval (NDJSON).
 			enc := json.NewEncoder(os.Stdout)
 			for {
-				if snap, err := getSnap(); err == nil {
+				if snap, ok := pollSnap(getSnap); ok {
 					enc.Encode(snap)
 				}
 				time.Sleep(cfg.Collect.Interval.Duration)
@@ -965,7 +1032,11 @@ func main() {
 				host.Hostname, host.OS, host.PlatformVersion)
 		}
 		for {
-			snap := mustSnap(getSnap)
+			snap, ok := pollSnap(getSnap)
+			if !ok {
+				time.Sleep(cfg.Collect.Interval.Duration)
+				continue
+			}
 			// Move cursor up to overwrite previous output (14 lines max).
 			fmt.Print("\033[2J\033[H") // clear screen
 			printBanner()
@@ -985,10 +1056,25 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Run 'beastie help' for usage.")
 			os.Exit(2)
 		}
+		// flag stops parsing at the first non-flag argument, so anything
+		// flag-shaped after the command was silently dropped — `beastie cpu
+		// --json` printed coloured text and exited 0, which a script piping
+		// into jq reads as valid output. Only `check` takes its own flags
+		// after the subcommand.
+		if bad := flagLikeArgs(trailingArgs(flag.Args())); len(bad) > 0 {
+			fmt.Fprintf(os.Stderr, "beastie: %s must come before the command: beastie %s %s\n",
+				strings.Join(bad, " "), strings.Join(bad, " "), cmd)
+			os.Exit(2)
+		}
 		if *jsonOut {
 			emitJSON(cmd, mustSnap(getSnap))
 			return
 		}
+
+		// Sample first: a failure here exits, and printing the banner and
+		// host line ahead of it would leave them above the error with no
+		// metrics under them.
+		snap := mustSnap(getSnap)
 
 		printBanner()
 
@@ -997,8 +1083,6 @@ func main() {
 			fmt.Printf(bold+"Host:"+reset+" %s  "+bold+"OS:"+reset+" %s %s\n\n",
 				host.Hostname, host.OS, host.PlatformVersion)
 		}
-
-		snap := mustSnap(getSnap)
 
 		switch cmd {
 		case "cpu":

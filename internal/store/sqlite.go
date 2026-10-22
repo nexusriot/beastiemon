@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,6 +25,27 @@ import (
 // so the Snapshot struct can grow without a schema migration.
 //
 // Writes happen on a single background goroutine fed by a buffered channel, so
+
+// explainOpen replaces the driver's error when the real problem is a history
+// directory the daemon user cannot write. SQLite answers that with "unable to
+// open database file: out of memory (14)", which sends an operator hunting a
+// memory leak that isn't there — and it is the single most likely store
+// misconfiguration, since beastied runs as _beastie while /var/db is root's.
+// Only the probe's own failure is reported, so a genuine driver error is never
+// masked.
+func explainOpen(path string, err error) error {
+	dir := filepath.Dir(path)
+	probe, perr := os.CreateTemp(dir, ".beastiemon-probe-*")
+	if perr == nil {
+		name := probe.Name()
+		probe.Close()
+		os.Remove(name)
+		return err
+	}
+	return fmt.Errorf("history directory %s is not writable by the daemon user "+
+		"(%v); chown it to the user beastied runs as: %w", dir, perr, err)
+}
+
 // Push never blocks the sampler's hot path (it drops if the writer is backed
 // up — the ring still has the sample). The still-filling current bucket is not
 // written until it rolls over (or Close flushes it); the ring covers that
@@ -67,11 +89,13 @@ type Options struct {
 // database at path and starts its background writer.
 func OpenSQLite(path string, opts Options) (*SQLite, error) {
 	if dir := filepath.Dir(path); dir != "" {
-		os.MkdirAll(dir, 0o755)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("history directory %s: %w", dir, err)
+		}
 	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, err
+		return nil, explainOpen(path, err)
 	}
 	// One connection serialises all access, sidestepping SQLite lock
 	// contention. Throughput here is ~1 write/minute, so this costs nothing.
@@ -83,7 +107,7 @@ func OpenSQLite(path string, opts Options) (*SQLite, error) {
 		dmax TEXT
 	)`); err != nil {
 		db.Close()
-		return nil, err
+		return nil, explainOpen(path, err)
 	}
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS alert_events (
 		id    INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -201,8 +201,11 @@ The config file lives at **`/usr/local/etc/beastiemon.conf`** (TOML).
 [server]
 # Bind address. Default localhost-only.
 # To expose on the LAN, change to "0.0.0.0:8088" and put nginx in front (see below).
-# An absolute path (e.g. "/var/run/beastied.sock") binds a Unix-domain socket
-# instead of TCP — local-only access with no port to firewall.
+# An absolute path (e.g. "/var/run/beastied/beastied.sock") binds a Unix-domain
+# socket instead of TCP — local-only access with no port to firewall. Keep it
+# under /var/run/beastied, which the rc.d script creates owned by the daemon
+# user: beastied binds after dropping to _beastie and cannot create a socket in
+# root-owned /var/run itself.
 listen = "127.0.0.1:8088"
 
 [collect]
@@ -295,6 +298,20 @@ stale_after = "0s"    # e.g. "30s"
 # webhook    = ""       # per-rule endpoint override
 # format     = ""       # per-rule payload-format override
 ```
+
+`beastied -t` checks the file before anything acts on it: it reports rule
+typos, the `proc_watch` mismatch, **and any setting it does not recognise** —
+a misspelled key decodes into nothing, so the host would otherwise monitor with
+a default nobody chose:
+
+```sh
+$ beastied -t
+beastiemon.conf: warning: unknown setting "collect.intervall" — check the
+  spelling; it is being ignored
+beastiemon.conf: configuration has 1 problem(s)
+```
+
+The same warnings are logged at startup and on each reload.
 
 After a change, restart — or send `SIGHUP` to reload most settings in place
 (auth, alerts, and the `[collect]` sampler options; `listen`, `ring_size`,
@@ -617,7 +634,7 @@ daemon's `/api/metrics` instead of sampling locally:
 ```sh
 beastie --remote auto status            # "auto" = server.listen from the config
 beastie --remote monitor.local:8088 top # over the network
-beastie --remote /var/run/beastied.sock mem   # daemon bound to a Unix socket
+beastie --remote /var/run/beastied/beastied.sock mem  # daemon on a Unix socket
 beastie --remote https://monitor.example.org check --warn 80 --crit 90 cpu
 ```
 
@@ -1070,6 +1087,38 @@ service beastied restart
 
 Check it took with `su -m _beastie -c 'pfctl -si'`. If pf itself is disabled,
 the card shows **disabled** rather than hiding — that is a different problem.
+
+**On FreeBSD 15 the devfs rule is not enough.** `pfctl` there reads pf through
+a netlink socket as well as `/dev/pf`, and an unprivileged process cannot open
+it — the rule gets you past `/dev/pf` only to fail at
+`pfctl: Failed to open netlink: Bad file descriptor`. There is no devfs knob
+for that, so on 15 the pf panel needs the daemon to keep root:
+
+```sh
+sysrc beastied_runas=root
+service beastied restart
+```
+
+Weigh that against what the panel is worth: everything else BeastieMon collects
+works unprivileged, and running the whole daemon as root for the pf card alone
+is a real trade. The collector degrades quietly either way.
+
+### Alerts fire but no webhook arrives
+
+Delivery is checked and failures are logged with the rule and the endpoint, so
+start with the log:
+
+```sh
+$ tail /var/log/beastied.log
+beastied: alert "root-fs": webhook https://hooks.example.com/x not delivered:
+  HTTP 404 Not Found
+```
+
+A revoked Slack hook (404), an endpoint that 500s, a DNS failure, a connection
+refused — all of them look identical from the dashboard, which keeps showing
+the rule as **firing** because the rule *is* firing; only the notification is
+lost. Rules whose POSTs all fail still record their events, so `/api/alerts`
+and the Alerts card are not evidence that anyone was paged.
 
 ### A rule stays "unknown" forever
 

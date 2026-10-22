@@ -88,9 +88,17 @@ type Engine struct {
 	// Sampler watchdog: fires when no snapshot has been evaluated for
 	// staleAfter — the one failure threshold rules can't see, because Eval
 	// stops being called at all.
-	staleAfter  time.Duration
-	lastSnap    time.Time
-	staleFiring bool
+	staleAfter time.Duration
+	lastSnap   time.Time
+	// staleFiring is whether the watchdog has fired and not yet resolved;
+	// staleLastFire is when that firing event went out, so the watchdog
+	// reports last_fire like any other rule instead of a zero time.
+	staleFiring   bool
+	staleLastFire time.Time
+
+	// onDeliveryError, when set, is called for every webhook POST that fails
+	// to land. Nothing under internal/ logs, so the daemon supplies the sink.
+	onDeliveryError func(ev Event, url string, err error)
 
 	history []Event // recent events, oldest first, capped at historyCap
 	sink    func(Event)
@@ -127,6 +135,18 @@ func New(cfg config.AlertsConfig) *Engine {
 func (e *Engine) SetSink(fn func(Event)) {
 	e.mu.Lock()
 	e.sink = fn
+	e.mu.Unlock()
+}
+
+// SetDeliveryErrorFunc registers a callback for webhook POSTs that fail — a
+// transport error or a non-2xx reply. Without it a dead endpoint is entirely
+// invisible: the rule still reads "firing" in /api/alerts and on the
+// dashboard, and the event is still recorded, so alerting looks healthy while
+// nothing is being delivered. That is the output-side twin of a rule that
+// cannot read its metric, and just as worth saying out loud.
+func (e *Engine) SetDeliveryErrorFunc(fn func(ev Event, url string, err error)) {
+	e.mu.Lock()
+	e.onDeliveryError = fn
 	e.mu.Unlock()
 }
 
@@ -220,6 +240,7 @@ func (e *Engine) CheckStale(now time.Time) {
 		return
 	}
 	e.staleFiring = true
+	e.staleLastFire = now
 	e.emitWatchdog(age.Seconds(), "firing", now)
 }
 
@@ -286,6 +307,7 @@ func (e *Engine) States() []RuleStatus {
 		if e.staleFiring {
 			st.State = "firing"
 			st.Since = e.lastSnap
+			st.LastFire = e.staleLastFire
 		}
 		out = append(out, st)
 	}
@@ -341,10 +363,25 @@ func (e *Engine) record(ev Event) {
 
 func (e *Engine) httpPost(url, format string, ev Event) {
 	contentType, body := renderPayload(format, ev)
+	// Read the callback here rather than in the goroutine: every caller of
+	// post holds e.mu, matching how record reads e.sink.
+	report := e.onDeliveryError
 	go func() {
 		resp, err := e.client.Post(url, contentType, bytes.NewReader(body))
-		if err == nil {
-			resp.Body.Close()
+		if err != nil {
+			if report != nil {
+				report(ev, url, err)
+			}
+			return
+		}
+		defer resp.Body.Close()
+		// A 2xx is the only acknowledgement that the notification landed.
+		// Anything else (404 from a revoked Slack hook, 500, a captive
+		// portal's redirect) means it did not.
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			if report != nil {
+				report(ev, url, fmt.Errorf("HTTP %s", resp.Status))
+			}
 		}
 	}()
 }

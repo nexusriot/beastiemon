@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"sort"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -13,6 +14,13 @@ type Config struct {
 	Auth    AuthConfig    `toml:"auth"`
 	Store   StoreConfig   `toml:"store"`
 	Alerts  AlertsConfig  `toml:"alerts"`
+
+	// Unknown holds keys present in the file that no field consumes —
+	// misspellings like "intervall" or "[collekt]". TOML decoding accepts
+	// them silently, which means the setting is simply not applied, and the
+	// host monitors with defaults nobody chose. Load fills this; the daemon
+	// reports it from `-t` and at startup, alongside the rule warnings.
+	Unknown []string `toml:"-"`
 }
 
 type ServerConfig struct {
@@ -168,8 +176,12 @@ func Load(path string) (Config, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return cfg, nil
 	}
-	_, err := toml.DecodeFile(path, &cfg)
+	md, err := toml.DecodeFile(path, &cfg)
 	if err == nil {
+		for _, key := range md.Undecoded() {
+			cfg.Unknown = append(cfg.Unknown, key.String())
+		}
+		sort.Strings(cfg.Unknown)
 		cfg.normalize()
 	}
 	return cfg, err

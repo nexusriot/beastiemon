@@ -765,12 +765,24 @@ func writeJSON(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+// maxRangeSeconds caps ?range= given in bare seconds. A century is past any
+// retention anyone configures and leaves the nanosecond conversion far inside
+// int64.
+const maxRangeSeconds = 100 * 365 * 24 * 3600
+
 func parseDuration(s string, def time.Duration) time.Duration {
 	if s == "" {
 		return def
 	}
-	// Accept plain integers as seconds for convenience.
+	// Accept plain integers as seconds for convenience. Clamp before
+	// multiplying: time.Duration is nanoseconds in an int64, so a seconds
+	// value past ~292 years wraps negative, and a negative range puts "since"
+	// in the future — the endpoint answered a huge request with an empty
+	// series rather than all of history.
 	if n, err := strconv.Atoi(s); err == nil {
+		if n > maxRangeSeconds {
+			n = maxRangeSeconds
+		}
 		return time.Duration(n) * time.Second
 	}
 	d, err := time.ParseDuration(s)

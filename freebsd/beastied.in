@@ -10,6 +10,7 @@
 # Optional overrides in /etc/rc.conf:
 #   beastied_config="/usr/local/etc/beastiemon.conf"
 #   beastied_runas="_beastie"     # unprivileged user daemon drops to
+#   beastied_rundir="/var/run/beastied"   # dir for a Unix-socket listen path
 #   beastied_flags=""
 #
 # NOTE: The variable is named "beastied_runas" on purpose.
@@ -29,6 +30,7 @@ load_rc_config "$name"
 : ${beastied_runas:="_beastie"}
 : ${beastied_config:="/usr/local/etc/beastiemon.conf"}
 : ${beastied_logfile:="/var/log/beastied.log"}
+: ${beastied_rundir:="/var/run/beastied"}
 : ${beastied_flags:=""}
 
 pidfile="/var/run/beastied.pid"
@@ -42,7 +44,10 @@ childpidfile="/var/run/beastied_child.pid"
 # rc.subr uses procname + pidfile for check_pidfile / pgrep, stop, and status.
 procname="/usr/sbin/daemon"
 command="/usr/sbin/daemon"
-command_args="-f -r -P ${pidfile} -p ${childpidfile} -u ${beastied_runas} \
+# -H makes daemon(8) close and re-open -o on SIGHUP. Without it the
+# supervisor keeps writing to the inode newsyslog(8) just rotated away, so
+# every log line after the first rotation is lost (see newsyslog.conf).
+command_args="-f -r -H -P ${pidfile} -p ${childpidfile} -u ${beastied_runas} \
     -o ${beastied_logfile} %%PREFIX%%/bin/beastied \
     -config ${beastied_config} ${beastied_flags}"
 
@@ -65,6 +70,13 @@ beastied_prestart() {
     touch "${beastied_logfile}"
     chown root:"${beastied_runas}" "${beastied_logfile}"
     chmod 0640 "${beastied_logfile}"
+    # A Unix-socket listen path needs a directory the daemon user can write:
+    # /var/run itself is root-owned, so beastied — which daemon(8) has already
+    # dropped to ${beastied_runas} by the time it binds — cannot create a
+    # socket directly in it. Hence the dedicated run directory that
+    # beastiemon.conf's socket example points into.
+    install -d -o "${beastied_runas}" -g "${beastied_runas}" -m 0755 \
+        "${beastied_rundir}"
 }
 
 run_rc_command "$1"

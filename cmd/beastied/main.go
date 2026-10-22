@@ -72,24 +72,33 @@ func main() {
 	// Optional alert engine (rebuilt on reload). buildAlerts wires the engine
 	// into the API (/api/alerts) and, when the store is on, persists events.
 	var alerts *alert.Engine
-	buildAlerts := func(ac config.AlertsConfig) {
-		if !ac.Enabled() {
+	buildAlerts := func(c config.Config) {
+		if !c.Alerts.Enabled() {
 			alerts = nil
 			srv.SetAlerts(nil)
 			return
 		}
-		// A typo in metric/field/op makes a rule silently never fire, which
-		// looks exactly like a rule that is simply never tripping. Say so.
-		for _, w := range alert.Validate(ac) {
+		// A typo in metric/field/op — or a proc rule naming something
+		// proc_watch never counts — makes a rule silently never fire, which
+		// looks exactly like a rule that is simply never tripping. Say so,
+		// with the same list `beastied -t` prints.
+		for _, w := range configWarnings(c) {
 			log.Printf("config: %s", w)
 		}
-		alerts = alert.New(ac)
+		alerts = alert.New(c.Alerts)
+		// A webhook nobody answers is invisible from inside the daemon: the
+		// rule still reads "firing" everywhere. Say so, naming the rule and
+		// the endpoint. Volume follows the operator's own `repeat` (0, the
+		// default, is one POST per episode).
+		alerts.SetDeliveryErrorFunc(func(ev alert.Event, url string, err error) {
+			log.Printf("alert %q: webhook %s not delivered: %v", ev.Rule, url, err)
+		})
 		if hist != nil {
 			alerts.SetSink(persistEvent(hist))
 		}
 		srv.SetAlerts(alerts)
 	}
-	buildAlerts(cfg.Alerts)
+	buildAlerts(cfg)
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -101,7 +110,8 @@ func main() {
 	}
 	httpSrv := &http.Server{Handler: srv}
 	go func() {
-		log.Printf("beastied %s listening on %s (%s)", version, cfg.Server.Listen, statusLine(cfg))
+		log.Printf("beastied %s listening on %s (%s)", version, cfg.Server.Listen,
+			statusLine(cfg, hist != nil))
 		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http: %v", err)
 		}
@@ -149,14 +159,14 @@ func main() {
 			}
 			// Apply hot-reloadable settings.
 			srv.SetAuth(newCfg.Auth)
-			buildAlerts(newCfg.Alerts)
+			buildAlerts(newCfg)
 			// Rebuild the sampler (interval, fs_include, net_exclude, top_procs, zfs, jails).
 			sampCancel()
 			sampCtx, sampCancel = context.WithCancel(rootCtx)
 			sampler = collect.NewSampler(newCfg)
 			go sampler.Run(sampCtx)
 			cfg = newCfg
-			log.Printf("reloaded configuration (%s)", statusLine(cfg))
+			log.Printf("reloaded configuration (%s)", statusLine(cfg, hist != nil))
 
 		case now := <-staleTick.C:
 			if alerts != nil {
@@ -179,23 +189,32 @@ func main() {
 // difference between a safe `service beastied reload` and a silent gap in
 // monitoring. Returns the process exit code.
 func testConfig(path string, cfg config.Config) int {
-	warns := alert.Validate(cfg.Alerts)
+	warns := configWarnings(cfg)
 	for _, w := range warns {
-		fmt.Printf("%s: warning: %s\n", path, w)
-	}
-	// A rule naming a process that proc_watch never counts can only ever read
-	// "unknown", and that pairing spans two config sections, so Validate (which
-	// sees only [alerts]) cannot catch it.
-	for _, w := range unwatchedProcRules(cfg) {
-		warns = append(warns, w)
 		fmt.Printf("%s: warning: %s\n", path, w)
 	}
 	if len(warns) > 0 {
 		fmt.Printf("%s: configuration has %d problem(s)\n", path, len(warns))
 		return 1
 	}
-	fmt.Printf("%s: syntax ok (%s)\n", path, statusLine(cfg))
+	// Nothing is running yet, so the store is reported as the file asks for it.
+	fmt.Printf("%s: syntax ok (%s)\n", path, statusLine(cfg, cfg.Store.Enabled()))
 	return 0
+}
+
+// configWarnings is every "this rule can never fire" problem in cfg: the ones
+// alert.Validate finds inside [alerts], plus the proc_watch mismatch that
+// spans two sections. `beastied -t` prints them and startup/reload log them,
+// from this one list, so the two can't drift apart — a rule that only -t
+// warned about would sit at "unknown" with nothing in the log to explain it.
+func configWarnings(cfg config.Config) []string {
+	var warns []string
+	for _, key := range cfg.Unknown {
+		warns = append(warns, fmt.Sprintf(
+			"unknown setting %q — check the spelling; it is being ignored", key))
+	}
+	warns = append(warns, alert.Validate(cfg.Alerts)...)
+	return append(warns, unwatchedProcRules(cfg)...)
 }
 
 // unwatchedProcRules reports proc rules whose field is not in proc_watch.
@@ -248,13 +267,17 @@ func listen(addr string) (net.Listener, error) {
 }
 
 // statusLine summarises the enabled optional subsystems for the startup log.
-func statusLine(cfg config.Config) string {
+// storeActive is whether a history store is really open, which is not the same
+// as cfg asking for one: a reload cannot attach a store (the path change needs
+// a restart), and logging "store on" there would promise persistence that is
+// not happening.
+func statusLine(cfg config.Config, storeActive bool) string {
 	auth := "auth off"
 	if cfg.Auth.Enabled() {
 		auth = "auth on"
 	}
 	store := "store off"
-	if cfg.Store.Enabled() {
+	if storeActive {
 		store = "store on"
 	}
 	return fmt.Sprintf("%s, %s, %d alert rule(s)", auth, store, len(cfg.Alerts.Rules))

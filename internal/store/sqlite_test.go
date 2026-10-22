@@ -1,7 +1,9 @@
 package store
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -325,4 +327,52 @@ func TestRollupCarriesNewFields(t *testing.T) {
 	if len(avg[0].Watch) != 1 || avg[0].Watch[0].Name != "sshd" {
 		t.Errorf("watch list lost in rollup: %+v", avg[0].Watch)
 	}
+}
+
+// SQLite reports a history directory it cannot write as "unable to open
+// database file: out of memory (14)", which sends an operator hunting a memory
+// leak that isn't there. It is also the likeliest store misconfiguration,
+// since beastied runs as _beastie while /var/db belongs to root.
+func TestOpenSQLiteExplainsUnusableDirectory(t *testing.T) {
+	// A regular file where a directory should be: MkdirAll fails with ENOTDIR
+	// for every user, root included, so this half runs everywhere.
+	t.Run("parent is a file", func(t *testing.T) {
+		blocker := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := OpenSQLite(filepath.Join(blocker, "history.db"), Options{})
+		if err == nil {
+			t.Fatal("opening under a regular file should fail")
+		}
+		if !strings.Contains(err.Error(), "history directory") {
+			t.Errorf("error should name the directory as the problem, got: %v", err)
+		}
+	})
+
+	t.Run("directory not writable", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores directory permissions")
+		}
+		dir := filepath.Join(t.TempDir(), "ro")
+		if err := os.Mkdir(dir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		_, err := OpenSQLite(filepath.Join(dir, "history.db"), Options{})
+		if err == nil {
+			t.Fatal("opening in an unwritable directory should fail")
+		}
+		if !strings.Contains(err.Error(), "not writable") {
+			t.Errorf("error should say the directory is not writable, got: %v", err)
+		}
+	})
+
+	// A usable directory still opens, so the probe never blocks the good path.
+	t.Run("writable directory still opens", func(t *testing.T) {
+		s, err := OpenSQLite(filepath.Join(t.TempDir(), "history.db"), Options{})
+		if err != nil {
+			t.Fatalf("a writable directory should open: %v", err)
+		}
+		s.Close()
+	})
 }

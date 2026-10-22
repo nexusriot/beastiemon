@@ -167,3 +167,103 @@ func TestOptInCollectorsDefaultOff(t *testing.T) {
 		t.Errorf("proc_watch should default empty, got %v", def.Collect.ProcWatch)
 	}
 }
+
+// A misspelled key decodes into nothing and the setting is silently not
+// applied, so the host monitors with a default nobody chose. Load records
+// them; the daemon reports them from -t and at startup.
+func TestLoadRecordsUnknownKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "typo.conf")
+	os.WriteFile(path, []byte(`
+[server]
+listen = "127.0.0.1:8088"
+
+[collect]
+intervall = "5s"
+ring_size = 100
+
+[collekt]
+top_procs = 9
+`), 0o644)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"collect.intervall", "collekt", "collekt.top_procs"}
+	if len(cfg.Unknown) != len(want) {
+		t.Fatalf("Unknown = %v, want %v", cfg.Unknown, want)
+	}
+	for i, w := range want {
+		if cfg.Unknown[i] != w {
+			t.Errorf("Unknown[%d] = %q, want %q", i, cfg.Unknown[i], w)
+		}
+	}
+	// The keys that *were* spelled correctly still apply.
+	if cfg.Collect.RingSize != 100 {
+		t.Errorf("ring_size = %d, want the file's 100", cfg.Collect.RingSize)
+	}
+	// And the misspelled one did not, which is exactly why it is worth saying.
+	if cfg.Collect.Interval.Duration != time.Second {
+		t.Errorf("interval = %v, want the 1s default", cfg.Collect.Interval.Duration)
+	}
+}
+
+// Every key the README documents must land in a field: if one is renamed or
+// dropped, the unknown-key check above would start rejecting valid configs,
+// which is worse than the silence it replaced.
+func TestEveryDocumentedKeyDecodes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "full.conf")
+	os.WriteFile(path, []byte(`
+[server]
+listen = "127.0.0.1:8088"
+
+[collect]
+interval = "1s"
+ring_size = 3600
+fs_include = ["/", "/var"]
+net_exclude = ["lo0"]
+top_procs = 5
+zfs = true
+jails = true
+pf = true
+zfs_datasets = 10
+proc_watch = ["sshd"]
+
+[auth]
+username = "admin"
+password = "pw"
+token = "tok"
+
+[store]
+path = "/tmp/history.db"
+retention = "720h"
+resolution = "1m"
+coarse_after = "168h"
+coarse_resolution = "1h"
+
+[alerts]
+webhook = "https://example.com/hook"
+format = "slack"
+stale_after = "30s"
+
+[[alerts.rule]]
+name = "cpu-sustained"
+metric = "cpu"
+field = "total"
+op = ">"
+threshold = 90
+for = "30s"
+repeat = "5m"
+hysteresis = 5
+webhook = "https://example.com/rule"
+format = "discord"
+`), 0o644)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Unknown) != 0 {
+		t.Errorf("documented keys reported as unknown: %v", cfg.Unknown)
+	}
+}

@@ -507,3 +507,34 @@ func TestPrometheusNewSeries(t *testing.T) {
 		t.Error("a never-scrubbed pool must not report a scan age")
 	}
 }
+
+// ?range= in bare seconds used to be multiplied straight into a time.Duration,
+// so a value past ~292 years wrapped negative and put "since" in the future:
+// the endpoint answered a huge request with an empty series instead of all of
+// history. Clamping keeps a big number meaning "everything".
+func TestParseDurationClampsHugeSecondValues(t *testing.T) {
+	def := 15 * time.Minute
+	huge := []string{"9223372036854775807", "100000000000", "999999999999999"}
+	for _, s := range huge {
+		got := parseDuration(s, def)
+		if got <= 0 {
+			t.Errorf("parseDuration(%q) = %v, want a large positive duration", s, got)
+		}
+		if got < 24*time.Hour {
+			t.Errorf("parseDuration(%q) = %v, want at least a day's worth", s, got)
+		}
+	}
+	// Ordinary values are untouched.
+	if got := parseDuration("300", def); got != 5*time.Minute {
+		t.Errorf("parseDuration(\"300\") = %v, want 5m", got)
+	}
+	if got := parseDuration("1h", def); got != time.Hour {
+		t.Errorf("parseDuration(\"1h\") = %v, want 1h", got)
+	}
+	if got := parseDuration("", def); got != def {
+		t.Errorf("parseDuration(\"\") = %v, want the default %v", got, def)
+	}
+	if got := parseDuration("nonsense", def); got != def {
+		t.Errorf("parseDuration(\"nonsense\") = %v, want the default %v", got, def)
+	}
+}

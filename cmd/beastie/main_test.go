@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -353,6 +355,197 @@ func TestCheckDefaultsCoverEveryAlertMetric(t *testing.T) {
 	for m := range checkDefaults {
 		if !slices.Contains(alert.Metrics(), m) {
 			t.Errorf("check offers metric %q that the alert engine doesn't know", m)
+		}
+	}
+}
+
+// A snapshot that could not be taken must not be printed as if it were real.
+// Before this, an unreachable --remote daemon still produced a full (all-zero)
+// render and exit 0 — and under --json a zero-filled object on stdout — so a
+// script could not tell a dead daemon from an idle host. check mode already
+// reported UNKNOWN/3 for the same failure; the plain commands now exit 1.
+func TestMustSnapExitsWhenCollectionFails(t *testing.T) {
+	restore := swapExit(t)
+	defer restore()
+
+	failing := func() (collect.Snapshot, error) {
+		return collect.Snapshot{}, errors.New("remote 127.0.0.1:9999: connection refused")
+	}
+	mustSnap(failing)
+	if gotExit == nil {
+		t.Fatal("a failed collection must exit, not print zeros and succeed")
+	}
+	if *gotExit != 1 {
+		t.Errorf("exit code = %d, want 1", *gotExit)
+	}
+
+	gotExit = nil
+	working := func() (collect.Snapshot, error) {
+		return collect.Snapshot{CPU: collect.CPUStats{Total: 12.5}}, nil
+	}
+	if snap := mustSnap(working); snap.CPU.Total != 12.5 {
+		t.Errorf("a good snapshot should pass through, got %+v", snap.CPU)
+	}
+	if gotExit != nil {
+		t.Errorf("a successful collection must not exit (got %d)", *gotExit)
+	}
+}
+
+// `top` is the one view where a failed sample should cost a frame, not the
+// session: it reports the error and tells the caller to skip the repaint
+// rather than drawing a screen of zeros.
+func TestPollSnapSkipsFrameWithoutExiting(t *testing.T) {
+	restore := swapExit(t)
+	defer restore()
+
+	failing := func() (collect.Snapshot, error) {
+		return collect.Snapshot{}, errors.New("sample timed out")
+	}
+	if _, ok := pollSnap(failing); ok {
+		t.Error("a failed sample must report ok=false so the frame is skipped")
+	}
+	if gotExit != nil {
+		t.Errorf("top must not exit on one bad sample (got %d)", *gotExit)
+	}
+
+	working := func() (collect.Snapshot, error) {
+		return collect.Snapshot{CPU: collect.CPUStats{Total: 7}}, nil
+	}
+	snap, ok := pollSnap(working)
+	if !ok || snap.CPU.Total != 7 {
+		t.Errorf("a good sample should repaint: ok=%v snap=%+v", ok, snap.CPU)
+	}
+}
+
+// gotExit records the status passed to osExit while swapExit is in force.
+var gotExit *int
+
+// swapExit redirects osExit into gotExit and silences stderr, so the tests can
+// observe the exit status of paths that would otherwise end the test binary.
+func swapExit(t *testing.T) func() {
+	t.Helper()
+	realExit, realErr := osExit, os.Stderr
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	os.Stderr = devnull
+	gotExit = nil
+	osExit = func(code int) { gotExit = &code }
+	return func() {
+		osExit, os.Stderr = realExit, realErr
+		devnull.Close()
+		gotExit = nil
+	}
+}
+
+// server.listen is a bind address, and the wildcard forms name every local
+// interface rather than a peer: connecting to 0.0.0.0 fails outright on
+// FreeBSD. Since README's "Exposing on the LAN" section tells installs to bind
+// "0.0.0.0:8088", --remote auto has to turn that into loopback or every
+// documented `beastie --remote auto …` on a LAN host fails.
+func TestRemoteAutoRewritesWildcardBind(t *testing.T) {
+	cases := []struct {
+		listen string
+		want   string
+	}{
+		{"0.0.0.0:8088", "http://127.0.0.1:8088"},
+		{":8088", "http://127.0.0.1:8088"},
+		{"[::]:8088", "http://[::1]:8088"},
+		// A concrete address is what the daemon actually answers on.
+		{"127.0.0.1:8088", "http://127.0.0.1:8088"},
+		{"192.168.1.10:9000", "http://192.168.1.10:9000"},
+		{"monitor.local:8088", "http://monitor.local:8088"},
+	}
+	for _, c := range cases {
+		cfg := config.Default()
+		cfg.Server.Listen = c.listen
+		_, base, err := remoteBase(cfg, "auto")
+		if err != nil {
+			t.Errorf("listen %q: unexpected error %v", c.listen, err)
+			continue
+		}
+		if base != c.want {
+			t.Errorf("listen %q: base = %q, want %q", c.listen, base, c.want)
+		}
+	}
+
+	// A Unix socket listen path is already dialable and must not be rewritten.
+	cfg := config.Default()
+	cfg.Server.Listen = "/var/run/beastied/beastied.sock"
+	if _, base, err := remoteBase(cfg, "auto"); err != nil || base != "http://beastied" {
+		t.Errorf("socket listen: base = %q err = %v, want the socket transport", base, err)
+	}
+}
+
+// The flag package stops parsing at the first non-flag argument, so a flag
+// written after the command was dropped without a word: `beastie cpu --json`
+// printed coloured text and exited 0, which a script piping into jq reads as
+// valid output. Only `check` takes its own flags after the subcommand.
+func TestFlagLikeArgs(t *testing.T) {
+	cases := []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"--json"}, []string{"--json"}},
+		{[]string{"-json"}, []string{"-json"}},
+		{[]string{"--no-color", "--json"}, []string{"--no-color", "--json"}},
+		{[]string{"extra", "--json"}, []string{"--json"}},
+		// Not flags: a bare dash, a negative number as a positional, nothing.
+		{[]string{"-"}, nil},
+		{[]string{}, nil},
+		{nil, nil},
+		{[]string{"something"}, nil},
+	}
+	for _, c := range cases {
+		got := flagLikeArgs(c.args)
+		if len(got) != len(c.want) {
+			t.Errorf("flagLikeArgs(%q) = %q, want %q", c.args, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("flagLikeArgs(%q) = %q, want %q", c.args, got, c.want)
+				break
+			}
+		}
+	}
+}
+
+// Plain `beastie` (and `beastie --json`) passes no positional arguments at
+// all, so flag.Args() is empty and the command defaults to status. Slicing
+// that for trailing flags has to cope with the empty case — taking args[1:]
+// blindly panicked on the most common invocation there is.
+func TestTrailingArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"no command at all", []string{}, nil},
+		{"nil args", nil, nil},
+		{"command only", []string{"cpu"}, nil},
+		{"command plus flag", []string{"cpu", "--json"}, []string{"--json"}},
+		{"command plus several", []string{"cpu", "--json", "x"}, []string{"--json", "x"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := trailingArgs(c.args)
+			if len(got) != len(c.want) {
+				t.Fatalf("trailingArgs(%q) = %q, want %q", c.args, got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Fatalf("trailingArgs(%q) = %q, want %q", c.args, got, c.want)
+				}
+			}
+		})
+	}
+
+	// The two together are what main does, and must stay panic-free.
+	for _, args := range [][]string{nil, {}, {"cpu"}, {"status", "--json"}} {
+		if bad := flagLikeArgs(trailingArgs(args)); len(bad) > 1 {
+			t.Errorf("unexpected flags from %q: %q", args, bad)
 		}
 	}
 }
