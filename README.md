@@ -107,30 +107,47 @@ cd beastiemon
 gmake all          # download deps, vendor uPlot, build both binaries
 ```
 
-This produces `./beastied` and `./beastie` in the project root.
+This produces `dist/freebsd-amd64/beastied` and `dist/freebsd-amd64/beastie`.
 
 ### Build targets
 
 | Target               | What it does |
 |----------------------|--------------|
 | `gmake all`          | `deps + vendor-js + build` (default) |
-| `gmake build`        | Cross-compile both binaries (defaults `GOOS=freebsd GOARCH=amd64`) |
+| `gmake build`        | Cross-compile both binaries into `dist/<goos>-<goarch>/` (defaults `GOOS=freebsd GOARCH=amd64`) |
 | `gmake build-native` | Compile for the current host (handy on Linux dev boxes) |
+| `gmake dist`         | Build and package every architecture in `ARCHES`, with a `SHA256SUMS` manifest |
 | `gmake vendor-js`    | Download uPlot to `web/vendor/` and rewrite `index.html` so the binary is self-contained at runtime (no CDN) |
 | `gmake stage`        | Lay out the install tree under `.stage/` |
 | `gmake install`      | Copy from staging into `$DESTDIR/$PREFIX` (run as root) |
 | `gmake pkg`          | Produce `.pkg/beastiemon-<VERSION>.pkg` |
+| `gmake pkg-docker`   | The same package, built in a container (no Go needed on the host) |
+| `gmake dist-docker`  | `dist` in a container |
 | `gmake clean`        | Remove build artefacts |
 | `gmake run`          | Build for host and run with the bundled sample config |
 | `gmake fmt`          | Run `gofmt -w .` |
-| `gmake lint`         | Run `go vet ./...` |
+| `gmake lint`         | `go vet` for the host, for FreeBSD, and for the e2e suite |
 | `gmake test`         | Run `go test ./...` |
+| `gmake e2e`          | Run the end-to-end suite in a container (see [Testing](#testing)) |
 
-Override `VERSION`, `PREFIX`, `GOOS`, `GOARCH`, or `DESTDIR` on the
-command line:
+Each target is a thin wrapper over a script in `scripts/`, so the same build
+runs from a shell, a Makefile or CI without a second copy of the logic:
+
+| Script                 | What it does |
+|------------------------|--------------|
+| `scripts/build.sh`     | Compile both binaries for one target (defaults to this machine) |
+| `scripts/stage.sh`     | Lay out the `$PREFIX` install tree under `.stage/` |
+| `scripts/mkpkg.sh`     | Turn a staged tree into a `.pkg` |
+| `scripts/release.sh`   | Every architecture, packaged, plus checksums |
+| `scripts/vendor-js.sh` | Fetch uPlot and point the embedded dashboard at it |
+| `scripts/Dockerfile`   | Runs those same scripts in a container for `pkg-docker` / `dist-docker` |
+
+Override `VERSION`, `PREFIX`, `GOOS`, `GOARCH`, `ABI`, `ARCHES` or `DESTDIR`
+on the command line:
 
 ```sh
-gmake VERSION=0.3.0 GOARCH=arm64 pkg
+gmake VERSION=0.3.0 GOARCH=arm64 ABI=FreeBSD:15:aarch64 pkg
+gmake ABI_VERSION=14 pkg            # a package for FreeBSD 14
 gmake PREFIX=/opt/beastiemon DESTDIR=/tmp/root install
 ```
 
@@ -149,12 +166,51 @@ serving needed.
 
 ## Building a FreeBSD Package
 
-On a FreeBSD host (or anywhere with `pkg-create`):
-
 ```sh
 gmake VERSION=0.2.0 pkg
 # .pkg/beastiemon-0.2.0.pkg
 ```
+
+This works **on any build host**, FreeBSD or not. Where `pkg(8)` is present
+and the package targets that machine's own ABI, it is used; otherwise
+`scripts/mkpkg.sh` writes the package itself with Go's standard library. Both
+produce something `pkg install` and `pkg check -s` accept — the hand-written
+one simply carries no per-file checksums and no `+COMPACT_MANIFEST`, which
+only a repository catalogue reads.
+
+A package names the ABI it is for, and `pkg(8)` can only stamp the ABI of the
+host it runs on. Cross-architecture builds therefore always take the portable
+path, so `gmake dist` on an amd64 FreeBSD box still produces a correctly
+labelled aarch64 package:
+
+```sh
+gmake dist
+# .pkg/beastiemon-0.2.0-amd64.pkg
+# .pkg/beastiemon-0.2.0-aarch64.pkg
+# .pkg/SHA256SUMS
+```
+
+### Without a toolchain: `gmake pkg-docker`
+
+```sh
+gmake pkg-docker     # one architecture
+gmake dist-docker    # every architecture in ARCHES, with checksums
+```
+
+The host needs Docker and nothing else — no Go, no FreeBSD. The container runs
+the same `scripts/` the host build does, so the result is the same package;
+what changes is that the Go toolchain is pinned by the image rather than
+whatever the machine happens to have, which makes the artefact reproducible
+across build hosts.
+
+Output lands in `.pkg/` and `dist/` owned by whoever ran `gmake`, with no
+image or container left behind — the final build stage holds nothing but the
+artefacts, and Docker writes them straight into the working tree.
+
+It also leaves the tree alone: `dist` runs `vendor-js`, which rewrites
+`web/index.html` and `web/assets.go` in place, and in a container that happens
+to the copy inside it. `gmake dist-docker` therefore produces a dashboard with
+uPlot embedded (no CDN at runtime) without touching your checkout.
 
 Inspect before installing:
 
@@ -1191,6 +1247,8 @@ internal/alert/    threshold rule engine: webhooks, states/events, sampler watch
 internal/api/      HTTP handlers, SSE/WebSocket, Prometheus /metrics, /api/alerts, auth gate
 web/               embedded HTML/JS/CSS (uPlot dashboard)
 freebsd/           rc.d, pkg manifest, sample conf, newsyslog rule
+scripts/           build, stage, package and release scripts (the Makefile calls these)
+test/e2e/          end-to-end suite and its container (`gmake e2e`)
 ```
 
 See [DESIGN.md](DESIGN.md) for the architectural rationale.
@@ -1226,8 +1284,11 @@ wrappers are gated.
 ### Testing
 
 ```sh
-gmake test        # go test ./...
+gmake test        # unit tests: go test ./...
+gmake e2e         # end-to-end against real binaries, in a container
 ```
+
+#### Unit tests
 
 Everything runs on any OS with the standard `testing` package — no live
 daemon, no FreeBSD host, no external framework. The suites:
@@ -1282,8 +1343,49 @@ daemon, no FreeBSD host, no external framework. The suites:
   the alert engine knows, and remote mode (target parsing plus a live
   `httptest` fetch with bearer auth).
 - [`cmd/beastied/main_test.go`](cmd/beastied/main_test.go) — `beastied -t`:
-  its exit codes, and the cross-section check that a `proc` rule names
-  something `[collect] proc_watch` actually counts.
+  its exit codes, the cross-section check that a `proc` rule names something
+  `[collect] proc_watch` actually counts, the reload status line reporting the
+  store that is *open* rather than the one the file asks for, and the
+  packaging contract: `daemon(8) -H` in the rc.d script (without it every log
+  line after the first rotation is written to the rotated inode) and a socket
+  example the unprivileged daemon can actually bind.
+
+#### End-to-end tests
+
+```sh
+gmake e2e
+```
+
+`gmake e2e` builds [`test/e2e/Dockerfile`](test/e2e/Dockerfile) and runs the
+suite inside it. The host needs Docker and nothing else — no Go toolchain, no
+free port, no leftover processes or databases afterwards. The suite starts
+real `beastied` processes against generated config files and drives them the
+way an operator does: HTTP requests, SIGHUP, SIGTERM, exit codes, and the
+`beastie` binary itself.
+
+It covers the served surface (static assets, `/api/*`, Prometheus, 503 before
+the first sample, 404s and the embedded filesystem's edges), `/api/series`
+shaping for all fourteen metrics with `cores=0`, `band=1` and range handling,
+SSE and WebSocket streaming including a dozen concurrent clients, the auth
+gate, the Unix-socket listener, the SQLite store (including alert events
+surviving a restart), SIGHUP reload and its refusal to apply a broken config,
+the alert engine end to end against a real webhook endpoint (raw, Slack and
+Discord payloads, the sampler watchdog, and failed deliveries reaching the
+log), `proc_watch`, every CLI subcommand and its `--json`, `check` exit codes,
+remote mode, and `beastied -t`.
+
+The FreeBSD-only collectors (ZFS, jails, pf, temperatures) compile to stubs on
+Linux, so what the container proves is the portable surface plus that each of
+those panels explains its absence rather than printing nothing. Their parsers
+are unit-tested on any OS, and the FreeBSD-specific half — `rc.d`, `pkg(8)`,
+`newsyslog` — is exercised by installing the package on a FreeBSD host.
+
+To iterate without rebuilding the image, run the same suite against the host's
+Go:
+
+```sh
+gmake e2e-local   # go test -tags e2e ./test/e2e
+```
 
 ### Contributing
 

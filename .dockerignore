@@ -1,0 +1,10 @@
+# Keep build output and local state out of the e2e image: the Dockerfile
+# builds everything it needs from source.
+.git
+.stage
+.pkg
+dist
+beastied
+beastie
+web/vendor
+*.test

@@ -11,9 +11,10 @@
 /beastied
 /beastie
 
-# Build & packaging output (Makefile STAGE / PKGDIR)
+# Build & packaging output (Makefile STAGE / PKGDIR / DIST)
 /.stage/
 /.pkg/
+/dist/
 
 # uPlot fetched by `gmake vendor-js` — reproducibly re-downloaded, not tracked.
 # (See DESIGN.md §9. Keep the committed assets.go/index.html on their CDN
