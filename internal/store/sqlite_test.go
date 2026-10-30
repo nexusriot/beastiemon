@@ -293,6 +293,9 @@ func TestRollupCarriesNewFields(t *testing.T) {
 	mk := func(off time.Duration, rxErr, drop float64, states uint64) collect.Snapshot {
 		s := snapAt(base.Add(off), 10)
 		s.Net = []collect.NetStats{{Interface: "em0", RxBps: 100, RxErr: rxErr}}
+		s.Disk = []collect.DiskStats{{Device: "ada0", BusyPct: rxErr * 10, ReadMs: drop}}
+		s.VMs = []collect.VMStat{{Name: "web", State: "running", PID: 812, CPUPct: rxErr * 50}}
+		s.Health = &collect.HostHealth{VulnKnown: true, Vulnerable: int(states)}
 		s.PF = &collect.PFStats{Enabled: true, States: states, StateLimit: 10000, DropRate: drop}
 		s.Watch = []collect.ProcWatch{{Name: "sshd", Count: 1}}
 		s.ZFS = []collect.ZFSStats{{Pool: "zroot", UsedPct: 50, Health: "DEGRADED",
@@ -310,6 +313,16 @@ func TestRollupCarriesNewFields(t *testing.T) {
 	if avg[0].Net[0].RxErr != 3 || lo[0].Net[0].RxErr != 2 || hi[0].Net[0].RxErr != 4 {
 		t.Errorf("net error envelope: avg=%v min=%v max=%v",
 			avg[0].Net[0].RxErr, lo[0].Net[0].RxErr, hi[0].Net[0].RxErr)
+	}
+	if d := avg[0].Disk; len(d) != 1 || d[0].BusyPct != 30 || d[0].ReadMs != 3 || hi[0].Disk[0].BusyPct != 40 {
+		t.Errorf("disk busy/latency rollup: avg=%+v max=%+v", avg[0].Disk, hi[0].Disk)
+	}
+	if v := avg[0].VMs; len(v) != 1 || v[0].CPUPct != 150 || v[0].PID != 812 || hi[0].VMs[0].CPUPct != 200 {
+		t.Errorf("vm rollup: avg=%+v max=%+v", avg[0].VMs, hi[0].VMs)
+	}
+	// Host health is a point-in-time check result, carried from the last sample.
+	if avg[0].Health == nil || avg[0].Health.Vulnerable != 300 {
+		t.Errorf("health should be carried from the last sample: %+v", avg[0].Health)
 	}
 	if avg[0].PF == nil || avg[0].PF.States != 200 || avg[0].PF.DropRate != 3 {
 		t.Errorf("pf rollup: %+v", avg[0].PF)

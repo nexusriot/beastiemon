@@ -124,6 +124,18 @@ type CollectConfig struct {
 	ZFS   bool `toml:"zfs"`
 	Jails bool `toml:"jails"`
 	PF    bool `toml:"pf"`
+	// Bhyve lists bhyve guests (one ps call per tick, like Jails).
+	Bhyve bool `toml:"bhyve"`
+
+	// HostHealth runs pkg audit, freebsd-version and bectl every
+	// HostHealthInterval (default 1h) in the background rather than every
+	// tick: what they report changes over days, not seconds.
+	HostHealth         bool     `toml:"host_health"`
+	HostHealthInterval Duration `toml:"host_health_interval"`
+	// HostHealthVulnXML is the pkg-audit(8) database to check against
+	// (default /var/db/pkg/vuln.xml). Only worth changing on a host with a
+	// non-default PKG_DBDIR.
+	HostHealthVulnXML string `toml:"host_health_vulnxml"`
 
 	// ZFSDatasets caps how many datasets (largest first) ride each snapshot
 	// when ZFS is on. 0 (default) collects none: a host with jails can have
@@ -160,6 +172,9 @@ func Default() Config {
 			NetExclude: []string{"lo0"},
 			RingSize:   3600,
 			TopProcs:   5,
+
+			HostHealthInterval: Duration{time.Hour},
+			HostHealthVulnXML:  "/var/db/pkg/vuln.xml",
 		},
 		Store: StoreConfig{
 			// Path empty => disabled. The rest apply once a path is set.
@@ -197,6 +212,13 @@ func (c *Config) normalize() {
 	}
 	if c.Collect.RingSize <= 0 {
 		c.Collect.RingSize = def.Collect.RingSize
+	}
+	// A zero interval would re-run pkg audit back to back.
+	if c.Collect.HostHealthInterval.Duration <= 0 {
+		c.Collect.HostHealthInterval = def.Collect.HostHealthInterval
+	}
+	if c.Collect.HostHealthVulnXML == "" {
+		c.Collect.HostHealthVulnXML = def.Collect.HostHealthVulnXML
 	}
 	if c.Collect.TopProcs <= 0 {
 		c.Collect.TopProcs = def.Collect.TopProcs

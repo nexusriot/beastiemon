@@ -452,6 +452,8 @@ body.paused .live-dot { background: var(--orange); animation: none; }
 .pf-row .pf-val { color: var(--text); }
 .pf-row .pf-val.crit { color: var(--red); }
 .pf-row .pf-val.warn { color: var(--orange); }
+.pf-row .pf-val.ok { color: var(--green); }
+.pf-row .pf-val.sub { color: var(--muted); padding-left: 1em; }
 
 /* ---- Watched processes -------------------------------------------- */
 .watch-row {

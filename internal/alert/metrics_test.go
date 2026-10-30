@@ -14,7 +14,9 @@ func bsdSnapshot() collect.Snapshot {
 			{Interface: "em1", RxBps: 25, TxBps: 25, RxErr: 3},
 		},
 		Disk: []collect.DiskStats{
-			{Device: "ada0", ReadBps: 1000, WriteBps: 500, ReadIOPS: 10, WriteIOPS: 5},
+			{Device: "ada0", ReadBps: 1000, WriteBps: 500, ReadIOPS: 10, WriteIOPS: 5,
+				BusyPct: 30, ReadMs: 0.5, WriteMs: 12},
+			{Device: "nda0", BusyPct: 92, ReadMs: 4, WriteMs: 1},
 		},
 		ZFS: []collect.ZFSStats{
 			{Pool: "zroot", UsedPct: 40, Health: "ONLINE", Scan: "scrub_done", ScanAgeHours: 10, ScanKnown: true},
@@ -24,6 +26,16 @@ func bsdSnapshot() collect.Snapshot {
 		Jails: []collect.JailStat{{JID: 1, Name: "web", Procs: 12}, {JID: 2, Name: "db", Procs: 4}},
 		Watch: []collect.ProcWatch{{Name: "sshd", Count: 0}, {Name: "nginx", Count: 3}},
 		PF:    &collect.PFStats{Enabled: true, States: 500, StateLimit: 10000, StatePct: 5, DropRate: 2, MatchRate: 54},
+		Health: &collect.HostHealth{
+			VulnKnown: true, Vulnerable: 3, VulnDBAgeHours: 30,
+			KernelKnown: true, RebootRequired: true,
+			BECount: 2, BEActive: "default", BENext: "14.2-upgrade",
+		},
+		VMs: []collect.VMStat{
+			{Name: "web", State: "running", CPUPct: 140},
+			{Name: "db", State: "running", CPUPct: 20},
+			{Name: "old", State: "orphaned"},
+		},
 	}
 }
 
@@ -37,6 +49,11 @@ func TestMetricValueNewMetrics(t *testing.T) {
 		{"net", "total_bps", 200},
 		{"disk", "total_bps", 1500},
 		{"disk", "total_iops", 15},
+		// Busy and latency take the worst device instead of summing.
+		{"disk", "busy_pct", 92},
+		{"disk", "read_ms", 4},
+		{"disk", "write_ms", 12},
+		{"disk", "latency_ms", 12},
 		// Error/drop rates now that the collector surfaces them.
 		{"net", "rx_err", 5},
 		{"net", "err", 6},
@@ -55,6 +72,13 @@ func TestMetricValueNewMetrics(t *testing.T) {
 		{"pf", "state_pct", 5},
 		{"pf", "states", 500},
 		{"pf", "drop_rate", 2},
+		{"host", "", 3},
+		{"host", "vulndb_age_hours", 30},
+		{"host", "reboot_required", 1},
+		{"host", "be_pending", 1},
+		{"vm", "count", 2},
+		{"vm", "orphaned", 1},
+		{"vm", "web", 140},
 	}
 	for _, c := range cases {
 		got, ok := metricValue(snap, c.metric, c.field)
@@ -186,5 +210,27 @@ func TestNewMetricsUnknownWhenSubsystemAbsent(t *testing.T) {
 	// and is what a "my jails died" rule needs to see.
 	if v, ok := metricValue(empty, "jail", "count"); !ok || v != 0 {
 		t.Errorf("jail.count = %v, %v; want 0, true", v, ok)
+	}
+}
+
+// Host-health parts that never succeeded must read unknown, not 0: a host
+// with no vuln.xml has not been shown to have zero vulnerable packages.
+func TestHostHealthUnknownParts(t *testing.T) {
+	snap := collect.Snapshot{Health: &collect.HostHealth{}}
+	for _, f := range []string{"vulnerable", "vulndb_age_hours", "reboot_required", "be_pending"} {
+		if _, ok := metricValue(snap, "host", f); ok {
+			t.Errorf("host.%s should be unknown before its check succeeds", f)
+		}
+	}
+	if _, ok := metricValue(collect.Snapshot{}, "host", ""); ok {
+		t.Error("host with host_health off should be unknown")
+	}
+	// An orphaned guest has no CPU to read, and zero guests is still a count.
+	snap = collect.Snapshot{VMs: []collect.VMStat{{Name: "old", State: "orphaned"}}}
+	if _, ok := metricValue(snap, "vm", "old"); ok {
+		t.Error("orphaned vm should not report CPU")
+	}
+	if v, ok := metricValue(collect.Snapshot{}, "vm", "count"); !ok || v != 0 {
+		t.Errorf("vm.count with no guests: got %v, %v; want 0, true", v, ok)
 	}
 }

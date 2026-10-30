@@ -86,6 +86,20 @@ func writePrometheus(w io.Writer, snap collect.Snapshot) {
 			fmt.Fprintf(w, "beastie_disk_bps{dev=\"%s\",dir=\"read\"} %g\n", promLabel(d.Device), d.ReadBps)
 			fmt.Fprintf(w, "beastie_disk_bps{dev=\"%s\",dir=\"write\"} %g\n", promLabel(d.Device), d.WriteBps)
 		}
+		g("beastie_disk_iops", "Disk operations per second.")
+		for _, d := range snap.Disk {
+			fmt.Fprintf(w, "beastie_disk_iops{dev=\"%s\",dir=\"read\"} %g\n", promLabel(d.Device), d.ReadIOPS)
+			fmt.Fprintf(w, "beastie_disk_iops{dev=\"%s\",dir=\"write\"} %g\n", promLabel(d.Device), d.WriteIOPS)
+		}
+		g("beastie_disk_busy_percent", "Share of the interval the disk had requests outstanding (gstat %busy).")
+		for _, d := range snap.Disk {
+			fmt.Fprintf(w, "beastie_disk_busy_percent{dev=\"%s\"} %g\n", promLabel(d.Device), d.BusyPct)
+		}
+		g("beastie_disk_latency_ms", "Mean disk service time per request in milliseconds.")
+		for _, d := range snap.Disk {
+			fmt.Fprintf(w, "beastie_disk_latency_ms{dev=\"%s\",dir=\"read\"} %g\n", promLabel(d.Device), d.ReadMs)
+			fmt.Fprintf(w, "beastie_disk_latency_ms{dev=\"%s\",dir=\"write\"} %g\n", promLabel(d.Device), d.WriteMs)
+		}
 	}
 
 	if len(snap.FS) > 0 {
@@ -176,6 +190,42 @@ func writePrometheus(w io.Writer, snap collect.Snapshot) {
 		for _, j := range snap.Jails {
 			fmt.Fprintf(w, "beastie_jail_procs{jid=\"%d\",name=\"%s\"} %d\n", j.JID, promLabel(j.Name), j.Procs)
 		}
+	}
+
+	if len(snap.VMs) > 0 {
+		g("beastie_vm_up", "bhyve guest state: 1 running, 0 orphaned (vmm instance without a process).")
+		for _, v := range snap.VMs {
+			fmt.Fprintf(w, "beastie_vm_up{vm=\"%s\"} %d\n", promLabel(v.Name), boolGauge(v.State == "running"))
+		}
+		g("beastie_vm_cpu_percent", "bhyve guest CPU usage (100 = one core).")
+		for _, v := range snap.VMs {
+			fmt.Fprintf(w, "beastie_vm_cpu_percent{vm=\"%s\"} %g\n", promLabel(v.Name), v.CPUPct)
+		}
+		g("beastie_vm_rss_bytes", "bhyve guest resident memory.")
+		for _, v := range snap.VMs {
+			fmt.Fprintf(w, "beastie_vm_rss_bytes{vm=\"%s\"} %d\n", promLabel(v.Name), v.RSS)
+		}
+	}
+
+	if h := snap.Health; h != nil {
+		// Unknown parts are omitted rather than reported as 0, which would
+		// read as "no vulnerable packages" on a host that never fetched vuln.xml.
+		if h.VulnKnown {
+			g("beastie_pkg_vulnerable", "Installed packages with known vulnerabilities (pkg audit).")
+			fmt.Fprintf(w, "beastie_pkg_vulnerable %d\n", h.Vulnerable)
+			g("beastie_pkg_vulndb_age_hours", "Age of the local pkg vuln.xml database.")
+			fmt.Fprintf(w, "beastie_pkg_vulndb_age_hours %g\n", h.VulnDBAgeHours)
+		}
+		if h.KernelKnown {
+			g("beastie_reboot_required", "1 when the installed kernel differs from the running one.")
+			fmt.Fprintf(w, "beastie_reboot_required %d\n", boolGauge(h.RebootRequired))
+		}
+		if h.BECount > 0 {
+			g("beastie_be_pending", "1 when the next boot selects a different boot environment.")
+			fmt.Fprintf(w, "beastie_be_pending %d\n", boolGauge(h.BEPending()))
+		}
+		g("beastie_health_checked_timestamp_seconds", "When the host-health check last ran.")
+		fmt.Fprintf(w, "beastie_health_checked_timestamp_seconds %d\n", h.CheckedAt.Unix())
 	}
 }
 

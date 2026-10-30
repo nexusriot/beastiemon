@@ -223,7 +223,42 @@ func configWarnings(cfg config.Config) []string {
 			"unknown setting %q — check the spelling; it is being ignored", key))
 	}
 	warns = append(warns, alert.Validate(cfg.Alerts)...)
-	return append(warns, unwatchedProcRules(cfg)...)
+	warns = append(warns, unwatchedProcRules(cfg)...)
+	return append(warns, disabledCollectorRules(cfg)...)
+}
+
+// disabledCollectorRules reports rules on a metric whose [collect] switch is
+// off. Most such rules sit at "unknown" forever; the count-style fields are
+// worse — jail.count and vm.count read 0 with nothing collected, so a "fewer
+// than N running" rule would fire on a host that merely has collection off.
+func disabledCollectorRules(cfg config.Config) []string {
+	c := cfg.Collect
+	switches := map[string]struct {
+		on  bool
+		key string
+	}{
+		"zfs":  {c.ZFS, "zfs"},
+		"arc":  {c.ZFS, "zfs"},
+		"jail": {c.Jails, "jails"},
+		"pf":   {c.PF, "pf"},
+		"vm":   {c.Bhyve, "bhyve"},
+		"host": {c.HostHealth, "host_health"},
+	}
+	var out []string
+	for _, r := range cfg.Alerts.Rules {
+		sw, gated := switches[r.Metric]
+		if !gated || sw.on {
+			continue
+		}
+		name := r.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		out = append(out, fmt.Sprintf(
+			"alert rule %q: metric %q needs [collect] %s = true — nothing is collected for it",
+			name, r.Metric, sw.key))
+	}
+	return out
 }
 
 // unwatchedProcRules reports proc rules whose field is not in proc_watch.

@@ -64,7 +64,7 @@ func (k *keyedAgg) add(key string, vals ...float64) {
 // maximum. Averaging alone erases the short spikes that make wide-range history
 // useful, so the min/max envelope is stored beside the average and surfaced by
 // /api/series?band=1. Set-valued fields that can't be averaged (processes,
-// jails, ARC) are carried from the most recent sample in the bucket.
+// jails, ARC, host health) are carried from the most recent sample in the bucket.
 type bucketAgg struct {
 	bucket time.Time
 	n      int
@@ -80,6 +80,10 @@ type bucketAgg struct {
 	fs   keyedAgg
 	temp keyedAgg
 	zfs  keyedAgg
+	vm   keyedAgg // CPUPct, RSS
+	// vmLast keeps each guest's identity fields (state, pid, uptime) as last
+	// seen, since a guest that stopped mid-bucket is absent from a.last.
+	vmLast map[string]collect.VMStat
 }
 
 func newBucketAgg(bucket time.Time) *bucketAgg {
@@ -87,10 +91,13 @@ func newBucketAgg(bucket time.Time) *bucketAgg {
 		bucket: bucket,
 		// Net carries eight fields since the error and drop rates joined it.
 		net:  newKeyedAgg(8),
-		disk: newKeyedAgg(4),
+		disk: newKeyedAgg(7),
 		fs:   newKeyedAgg(4),
 		temp: newKeyedAgg(1),
 		zfs:  newKeyedAgg(4),
+		vm:   newKeyedAgg(2),
+
+		vmLast: map[string]collect.VMStat{},
 	}
 }
 
@@ -135,7 +142,8 @@ func (a *bucketAgg) add(s collect.Snapshot) {
 		a.pf[5].add(p.DropRate)
 	}
 	for _, d := range s.Disk {
-		a.disk.add(d.Device, d.ReadBps, d.WriteBps, d.ReadIOPS, d.WriteIOPS)
+		a.disk.add(d.Device, d.ReadBps, d.WriteBps, d.ReadIOPS, d.WriteIOPS,
+			d.BusyPct, d.ReadMs, d.WriteMs)
 	}
 	for _, f := range s.FS {
 		a.fs.add(f.Mount, float64(f.Total), float64(f.Used), float64(f.Free), f.UsedPct)
@@ -145,6 +153,10 @@ func (a *bucketAgg) add(s collect.Snapshot) {
 	}
 	for _, z := range s.ZFS {
 		a.zfs.add(z.Pool, float64(z.Size), float64(z.Alloc), float64(z.Free), z.UsedPct)
+	}
+	for _, v := range s.VMs {
+		a.vm.add(v.Name, v.CPUPct, float64(v.RSS))
+		a.vmLast[v.Name] = v
 	}
 }
 
@@ -167,6 +179,7 @@ func (a *bucketAgg) build(pick func(stat) float64) collect.Snapshot {
 		ARC:      a.last.ARC,
 		Datasets: a.last.Datasets,
 		Watch:    a.last.Watch,
+		Health:   a.last.Health,
 	}
 	if a.last.PF != nil {
 		s.PF = &collect.PFStats{
@@ -205,6 +218,7 @@ func (a *bucketAgg) build(pick func(stat) float64) collect.Snapshot {
 		f := a.disk.fields[key]
 		s.Disk = append(s.Disk, collect.DiskStats{
 			Device: key, ReadBps: pick(f[0]), WriteBps: pick(f[1]), ReadIOPS: pick(f[2]), WriteIOPS: pick(f[3]),
+			BusyPct: pick(f[4]), ReadMs: pick(f[5]), WriteMs: pick(f[6]),
 		})
 	}
 	for _, key := range a.fs.order {
@@ -233,6 +247,12 @@ func (a *bucketAgg) build(pick func(stat) float64) collect.Snapshot {
 			z.ScanPct, z.ScanAgeHours, z.ScanKnown = last.ScanPct, last.ScanAgeHours, last.ScanKnown
 		}
 		s.ZFS = append(s.ZFS, z)
+	}
+	for _, key := range a.vm.order {
+		f := a.vm.fields[key]
+		v := a.vmLast[key]
+		v.CPUPct, v.RSS = pick(f[0]), uint64(pick(f[1]))
+		s.VMs = append(s.VMs, v)
 	}
 	return s
 }

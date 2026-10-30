@@ -42,7 +42,8 @@ DOCKER_PKG = docker build -f scripts/Dockerfile --target artifact \
 export VERSION PREFIX STAGE PKGDIR UPLOT_VER ARCHES
 
 .PHONY: all build build-native dist vendor-js deps stage install pkg \
-        pkg-docker dist-docker clean run lint fmt test e2e e2e-local
+        pkg-docker dist-docker clean run lint fmt test e2e e2e-local \
+        e2e-freebsd e2e-remote
 
 all: deps vendor-js build
 
@@ -96,6 +97,7 @@ lint:
 	go vet ./...
 	GOOS=$(GOOS) go vet ./...
 	go vet -tags e2e ./test/...
+	GOOS=freebsd go vet -tags e2e ./test/...
 
 fmt:
 	gofmt -w .
@@ -112,3 +114,14 @@ e2e:
 # The same suite against the host's Go, for iterating without a rebuild.
 e2e-local:
 	go test -tags e2e -count=1 -v ./test/e2e
+
+# On a FreeBSD host, as root: the whole suite plus the FreeBSD-only tests
+# (host health, bhyve, ZFS, jails) against the real base-system tools.
+e2e-freebsd:
+	@[ "$$(uname -s)" = FreeBSD ] || { echo "e2e-freebsd: run this on FreeBSD (or use e2e-remote)" >&2; exit 2; }
+	@[ "$$(id -u)" = 0 ] || { echo "e2e-freebsd: needs root" >&2; exit 2; }
+	go test -tags e2e -count=1 -v ./test/e2e
+
+# The same, on a FreeBSD box over ssh: E2E_HOST=root@host gmake e2e-remote
+e2e-remote:
+	sh scripts/e2e-remote.sh

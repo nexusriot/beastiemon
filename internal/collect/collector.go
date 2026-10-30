@@ -21,6 +21,9 @@ type Sampler struct {
 	fs   *FSCollector
 	proc *ProcCollector
 	pf   *PFCollector
+	vm   *VMCollector
+	// health is nil unless [collect] host_health is on.
+	health *HostHealthCollector
 }
 
 func NewSampler(cfg config.Config) *Sampler {
@@ -31,8 +34,21 @@ func NewSampler(cfg config.Config) *Sampler {
 		fs:   NewFSCollector(cfg.Collect.FSInclude),
 		proc: NewProcCollector(cfg.Collect.TopProcs, cfg.Collect.ProcWatch),
 		pf:   &PFCollector{},
+		vm:   &VMCollector{},
+		health: func() *HostHealthCollector {
+			if !cfg.Collect.HostHealth {
+				return nil
+			}
+			return NewHostHealthCollector(cfg.Collect.HostHealthInterval.Duration, cfg.Collect.HostHealthVulnXML)
+		}(),
 	}
 }
+
+// hostHealthWait is how long the first snapshot waits for the first
+// host-health check beyond the usual warm-up. Without it a one-shot CLI run
+// would always print the section empty; a check slower than this simply lands
+// in a later snapshot.
+const hostHealthWait = 3 * time.Second
 
 func (s *Sampler) Run(ctx context.Context) {
 	tick := time.NewTicker(s.cfg.Collect.Interval.Duration)
@@ -46,7 +62,21 @@ func (s *Sampler) Run(ctx context.Context) {
 	if s.cfg.Collect.PF {
 		s.pf.Collect()
 	}
+	if s.cfg.Collect.Bhyve {
+		s.vm.Collect()
+	}
+	if s.health != nil {
+		go s.health.Run(ctx)
+	}
 	time.Sleep(s.cfg.Collect.Interval.Duration)
+	if s.health != nil {
+		select {
+		case <-s.health.Ready():
+		case <-time.After(hostHealthWait):
+		case <-ctx.Done():
+			return
+		}
+	}
 
 	for {
 		select {
@@ -90,6 +120,12 @@ func (s *Sampler) collect(t time.Time) Snapshot {
 	}
 	if s.cfg.Collect.PF {
 		snap.PF = s.pf.Collect()
+	}
+	if s.cfg.Collect.Bhyve {
+		snap.VMs = s.vm.Collect()
+	}
+	if s.health != nil {
+		snap.Health = s.health.Latest()
 	}
 	if load != nil {
 		snap.Load = LoadStats{

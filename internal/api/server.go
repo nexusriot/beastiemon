@@ -275,8 +275,8 @@ type seriesResp struct {
 }
 
 // handleSeries returns a time series in uPlot format.
-// Query params: metric (cpu|mem|load|net|neterr|disk|temp|fs|proc|procwatch|
-// zfs|arc|jail|pf), range (e.g. 15m, 1h), iface= (net, neterr), dev= (disk),
+// Query params: metric (cpu|mem|load|net|neterr|disk|disklat|temp|fs|proc|procwatch|
+// zfs|arc|jail|pf|vm), range (e.g. 15m, 1h), iface= (net, neterr), dev= (disk, disklat),
 // mount= (fs), pid= (proc), pool= (zfs), jid= (jail), name= (procwatch),
 // band=1 (append <label>_min/<label>_max envelope columns per series),
 // cores=0 (drop the per-core columns from metric=cpu).
@@ -429,6 +429,26 @@ func seriesColumns(metric string, snaps []collect.Snapshot, q url.Values) (label
 			}
 		}
 		return []string{"read_bps", "write_bps"}, [][]float64{rd, wr}, true
+
+	case "disklat":
+		// Busy % and latency don't add up across devices the way bytes do, so
+		// without dev= each point is the worst device at that instant — the
+		// one that is actually the bottleneck.
+		dev := q.Get("dev")
+		busy := make([]float64, len(snaps))
+		rms := make([]float64, len(snaps))
+		wms := make([]float64, len(snaps))
+		for i, snap := range snaps {
+			for _, d := range snap.Disk {
+				if dev != "" && d.Device != dev {
+					continue
+				}
+				busy[i] = max(busy[i], d.BusyPct)
+				rms[i] = max(rms[i], d.ReadMs)
+				wms[i] = max(wms[i], d.WriteMs)
+			}
+		}
+		return []string{"busy_pct", "read_ms", "write_ms"}, [][]float64{busy, rms, wms}, true
 
 	case "temp":
 		// One series per sensor name found in any snapshot.
@@ -588,6 +608,30 @@ func seriesColumns(metric string, snaps []collect.Snapshot, q url.Values) (label
 				}
 			}
 			cols = append(cols, series)
+		}
+		return labels, cols, true
+
+	case "vm":
+		name := q.Get("name")
+		// One CPU-% column per guest in the latest snapshot (or just name=),
+		// 0 where it wasn't running. Orphaned instances have no process and
+		// so no CPU to chart.
+		if len(snaps) > 0 {
+			for _, v := range snaps[len(snaps)-1].VMs {
+				if v.State != "running" || (name != "" && v.Name != name) {
+					continue
+				}
+				labels = append(labels, v.Name)
+				series := make([]float64, len(snaps))
+				for i, snap := range snaps {
+					for _, vv := range snap.VMs {
+						if vv.Name == v.Name {
+							series[i] = vv.CPUPct
+						}
+					}
+				}
+				cols = append(cols, series)
+			}
 		}
 		return labels, cols, true
 	}

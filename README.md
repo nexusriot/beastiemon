@@ -130,6 +130,8 @@ This produces `dist/freebsd-amd64/beastied` and `dist/freebsd-amd64/beastie`.
 | `gmake lint`         | `go vet` for the host, for FreeBSD, and for the e2e suite |
 | `gmake test`         | Run `go test ./...` |
 | `gmake e2e`          | Run the end-to-end suite in a container (see [Testing](#testing)) |
+| `gmake e2e-freebsd`  | The suite plus the FreeBSD-only tests, on a FreeBSD host as root |
+| `gmake e2e-remote`   | `e2e-freebsd` on a FreeBSD box over ssh (`E2E_HOST=root@host`) |
 
 Each target is a thin wrapper over a script in `scripts/`, so the same build
 runs from a shell, a Makefile or CI without a second copy of the logic:
@@ -292,6 +294,13 @@ top_procs = 5
 zfs   = false
 jails = false
 pf    = false
+bhyve = false        # bhyve guests (one ps call per tick)
+
+# Host-health check: pkg audit, pending kernel reboot, boot environments.
+# Runs in the background on its own interval, not every tick. See "Host health" below.
+host_health          = false
+host_health_interval = "1h"
+host_health_vulnxml  = "/var/db/pkg/vuln.xml"   # only differs with a non-default PKG_DBDIR
 
 # With zfs = true, also report the N largest datasets. 0 collects none: a host
 # with jails can have hundreds, and they would all ride every snapshot.
@@ -414,13 +423,15 @@ The default (`raw`) posts the alert as JSON:
 | `load` | `load1` `load5` `load15` |
 | `fs`   | a mount point, or `max` (default) |
 | `temp` | a sensor name, or `max` (default) |
-| `disk` | `read_bps` `write_bps` `read_iops` `write_iops` `total_bps` `total_iops` |
+| `disk` | `read_bps` `write_bps` `read_iops` `write_iops` `total_bps` `total_iops` — summed across devices; `busy_pct` `read_ms` `write_ms` `latency_ms` (worse of read/write) — worst device |
 | `net`  | `rx_bps` `tx_bps` `rx_pps` `tx_pps` `total_bps` `rx_err` `tx_err` `err` `rx_drop` `tx_drop` `drop` |
 | `zfs`  | `used_pct` `health` `scan_pct` `scan_age_hours` — worst case across pools |
 | `arc`  | `hit_rate` `size` `target` |
 | `jail` | `count`, or a jail name (that jail's process count) |
 | `proc` | a name from `[collect] proc_watch` (its running count) |
 | `pf`   | `state_pct` `states` `drop_rate` `match_rate` `search_rate` `insert_rate` |
+| `host` | `vulnerable` (default) `vulndb_age_hours` `reboot_required` `be_pending` — each reads unknown until its check has succeeded |
+| `vm`   | `count` (running guests), `orphaned`, or a guest name (its CPU%, 100 = one core) |
 
 `zfs.health` is graded numerically so the ordinary comparator can alert on it
 without a string-matching rule language: **0** `ONLINE`, **1** `DEGRADED`,
@@ -476,6 +487,37 @@ the sampler itself wedging. When no sample has arrived for that long, a
 synthetic `watchdog` alert fires to the section-level `webhook` (value =
 seconds since the last sample) and resolves on the next sample. It appears in
 `/api/alerts` and the dashboard like any rule.
+
+### Host health
+
+`[collect] host_health = true` adds a background check that runs at start-up
+and then every `host_health_interval` (default `1h`). It reports three things,
+each on its own — one failing leaves that part *unknown* rather than taking the
+others down:
+
+| Check | Source | Notes |
+|-------|--------|-------|
+| Vulnerable packages | `pkg audit -q -f` against `host_health_vulnxml` (default `/var/db/pkg/vuln.xml`) | The daemon never fetches the database (it makes no outbound connections except webhooks). FreeBSD's daily `periodic security` run refreshes it by default; `vulndb_age_hours` lets you alert when that stops. |
+| Reboot required | `freebsd-version -r` vs `-k` | True when a newer kernel is installed than the one running — `freebsd-update install` or a kernel build was done and the host never rebooted. Pending *fetched-but-not-installed* updates are not detected: `/var/db/freebsd-update` is root-only. |
+| Boot environments | `bectl list -H` | Active and next-boot environment. `be_pending` is 1 after `bectl activate` until the reboot. Omitted on a host that doesn't boot from ZFS, or if `bectl` can't run as `_beastie`. |
+
+```toml
+# Alert when anything installed has a known vulnerability, or the
+# vulnerability database has gone stale.
+[[alerts.rule]]
+name      = "vulnerable-packages"
+metric    = "host"
+field     = "vulnerable"
+op        = ">"
+threshold = 0
+
+[[alerts.rule]]
+name      = "vuln-db-stale"
+metric    = "host"
+field     = "vulndb_age_hours"
+op        = ">"
+threshold = 72
+```
 
 ### Defaults if no config file exists
 
@@ -607,13 +649,15 @@ printed last. `beastie proc` shows just the process table.
 | `beastie jail`    | Running jails |
 | `beastie pf`      | pf state table and counters |
 | `beastie watch`   | Watched processes (`proc_watch`) |
+| `beastie vm`      | bhyve guests |
+| `beastie health`  | Vulnerable packages, pending reboot, boot environments |
 | `beastie top`     | Continuous refresh — like `top(1)`, Ctrl-C to quit |
 | `beastie check`   | Nagios-style threshold check (see below) |
 | `beastie alerts`  | Rule states from a running daemon (needs `--remote`) |
 | `beastie version` | Print version and exit |
 | `beastie help`    | Usage |
 
-`zfs`, `jail`, `pf` and `watch` need the matching `[collect]` switch; without
+`zfs`, `jail`, `pf`, `watch`, `vm` and `health` need the matching `[collect]` switch; without
 it they say so rather than printing nothing. The full `status` view shows each
 of them only when it produced something, so a host that uses none of them
 looks exactly as it did before.
@@ -636,7 +680,8 @@ Metrics: `cpu` (total%), `mem` (used%), `swap` (used%), `load` (load1),
 `fs` (worst mount used%), `temp` (hottest sensor °C), `net` (total rx+tx
 bytes/s across interfaces), `disk` (total read+write bytes/s across devices),
 `zfs` (worst pool used%), `arc` (hit%), `jail` (running jails), `pf` (state
-table %), `proc` (needs `--field`).
+table %), `host` (vulnerable packages), `vm` (running guests), `proc` (needs
+`--field`).
 
 **`--field` selects within a metric**, using the same names a
 [[alerts.rule]](#alerting) takes — one metric table serves both, so a check
@@ -787,6 +832,8 @@ for charts.
 - **Network** — RX / TX, sums all NICs by default; per-iface tabs appear
   if you have more than one.
 - **Disk I/O** — read / write, with per-device tabs.
+- **Disk Busy & Latency** — `%busy` plus read/write ms per request, following
+  the Disk I/O device tab (worst device when none is selected).
 - **Temperatures** — bar gauges, colour-coded (green / orange / red).
 - **Filesystems** — usage progress bars per mount.
 - **Top Processes** — live-updating table of `top_procs` processes by
@@ -808,6 +855,13 @@ for charts.
   `state-limit` and `congestion` counters — traffic pf discarded for want of
   resources rather than by a rule — so anything above zero is a real incident.
   Hidden unless `[collect] pf = true` and `/dev/pf` is readable.
+- **bhyve VMs** — one row per guest: CPU (100% = one core), RSS, PID and
+  uptime. A `/dev/vmm` instance with no bhyve process is shown as
+  **orphaned** — it still holds the guest's wired memory until
+  `bhyvectl --destroy`. Hidden unless `[collect] bhyve = true` and guests exist.
+- **Host Health** — vulnerable package count (with names), the age of
+  `vuln.xml`, whether a newer kernel is installed than the one running, and the
+  active / next-boot boot environment. Hidden unless `[collect] host_health = true`.
 
 The range selector (5 m / 15 m / 1 h / 6 h / 24 h) re-fetches historical
 data; live updates flow over SSE and are appended to the existing series
@@ -869,17 +923,21 @@ Returns uPlot-shaped data:
 }
 ```
 
-Supported metrics: `cpu`, `mem`, `load`, `net`, `neterr`, `disk`, `temp`, `fs`,
-`proc`, `procwatch`, `zfs`, `arc`, `jail`, `pf`. Optional filters: `iface=em0`
-(`net`, `neterr`), `dev=ada0` (`disk`), `mount=/` (`fs`), `pid=845` (`proc`),
-`pool=zroot` (`zfs`), `jid=3` (`jail`), `name=sshd` (`procwatch`). `fs` returns
+Supported metrics: `cpu`, `mem`, `load`, `net`, `neterr`, `disk`, `disklat`, `temp`, `fs`,
+`proc`, `procwatch`, `zfs`, `arc`, `jail`, `pf`, `vm`. Optional filters: `iface=em0`
+(`net`, `neterr`), `dev=ada0` (`disk`, `disklat`), `mount=/` (`fs`), `pid=845` (`proc`),
+`pool=zroot` (`zfs`), `jid=3` (`jail`), `name=sshd` (`procwatch`), `name=web`
+(`vm`, one CPU-% series per running guest). `fs` returns
 one used-% series per mount and `zfs` one per pool; `proc` returns one CPU-%
 series per process in the latest sample, `jail` one process-count series per
 jail, and `procwatch` one running-count series per watched name (so "when did
 sshd stop" has an answer, not just a current state); `arc` returns
 `size`/`target` (bytes) and `hit_rate` (%) columns; `neterr` returns
 `rx_err`/`tx_err`/`rx_drop`/`tx_drop`, charted apart from throughput because
-they share no useful axis with bytes/sec; `pf` returns `states`, `state_pct`,
+they share no useful axis with bytes/sec; `disklat` returns `busy_pct` (share of
+the interval the device had requests outstanding, as in `gstat`'s `%busy`) and
+`read_ms`/`write_ms` (mean service time per request), taking the worst device
+per point rather than a sum when no `dev=` is given; `pf` returns `states`, `state_pct`,
 `match_rate` and `drop_rate`.
 
 `metric=cpu` includes one column per core by default. Add **`cores=0`** to drop
@@ -964,8 +1022,16 @@ Also exported: `beastie_net_errors{iface,dir}` and `beastie_net_drops{iface,dir}
 `beastie_zfs_health{pool,state}` (the same 0/1/2 ordinal the alert engine
 uses, so a Prometheus rule and a `[[alerts.rule]]` agree on what `1` means),
 `beastie_zfs_scan_age_hours{pool}` (omitted for a pool that has never been
-scrubbed, since `0` would read as "scrubbed just now"), and
-`beastie_zfs_dataset_bytes{dataset,kind}`.
+scrubbed, since `0` would read as "scrubbed just now"),
+`beastie_zfs_dataset_bytes{dataset,kind}`, and per-device disk health:
+`beastie_disk_iops{dev,dir}`, `beastie_disk_busy_percent{dev}` and
+`beastie_disk_latency_ms{dev,dir}` (mean ms per request, `0` for an interval
+with no requests of that kind). With `bhyve`: `beastie_vm_up{vm}` (0 =
+orphaned), `beastie_vm_cpu_percent{vm}`, `beastie_vm_rss_bytes{vm}`. With
+`host_health`: `beastie_pkg_vulnerable`, `beastie_pkg_vulndb_age_hours`,
+`beastie_reboot_required`, `beastie_be_pending` — each omitted until its check
+has succeeded, so a missing `vuln.xml` never exports a reassuring `0` — and
+`beastie_health_checked_timestamp_seconds`.
 
 ```yaml
 # prometheus.yml
@@ -1177,6 +1243,24 @@ Weigh that against what the panel is worth: everything else BeastieMon collects
 works unprivileged, and running the whole daemon as root for the pf card alone
 is a real trade. The collector degrades quietly either way.
 
+### Host Health says vulnerable packages are "unknown"
+
+There is no `/var/db/pkg/vuln.xml` yet, or `pkg audit` couldn't read it.
+BeastieMon deliberately doesn't download it. Fetch it once as root, and make
+sure the daily periodic run keeps it fresh (it's on by default):
+
+```sh
+pkg audit -F
+sysrc -f /etc/periodic.conf security_status_pkgaudit_enable=YES
+```
+
+### bhyve VMs card shows an "orphaned" guest
+
+The kernel still has a `/dev/vmm/<name>` instance but no bhyve process is
+running it, usually after a guest crashed or was killed. It keeps holding the
+guest's wired memory. Remove it with `bhyvectl --destroy --vm=<name>` (as root),
+or restart the guest.
+
 ### Alerts fire but no webhook arrives
 
 Delivery is checked and failures are logged with the rule and the endpoint, so
@@ -1219,9 +1303,12 @@ because the store is configured and open; it is the writes that are failing.
 The metric can't be read: a mount that isn't mounted, a host with no
 temperature sensors, `metric = "zfs"` without `[collect] zfs = true`, or a
 `proc` rule naming something that isn't in `[collect] proc_watch`. Run
-`beastied -t` — it reports rule typos *and* the proc_watch mismatch, which
-spans two config sections and so can't be caught by looking at `[alerts]`
-alone:
+`beastied -t` — it reports rule typos *and* the cross-section mistakes that
+can't be caught by looking at `[alerts]` alone: a proc_watch mismatch, and a
+rule on a metric whose `[collect]` switch is off (`zfs`/`arc`, `jail`, `pf`,
+`vm`, `host`). That second one matters beyond "unknown": `jail.count` and
+`vm.count` read 0 with nothing collected, so a "fewer than N running" rule
+would fire on a host that merely has collection off.
 
 ```sh
 $ beastied -t
@@ -1340,7 +1427,7 @@ daemon, no FreeBSD host, no external framework. The suites:
 - [`internal/api/features_test.go`](internal/api/features_test.go) — the
   Prometheus `/metrics` exposition (including the net error/drop, pf,
   proc-watch, dataset and ZFS health/scan series), `/api/series` shaping
-  (`fs`, `proc`, `procwatch`, `zfs`, `arc`, `jail`, `neterr`, `pf`, `band=1`,
+  (`fs`, `proc`, `procwatch`, `zfs`, `arc`, `jail`, `neterr`, `disklat`, `pf`, `band=1`,
   and the `cores=0` opt-out), `/api/alerts`, and the WebSocket stream.
 - [`internal/alert/alert_test.go`](internal/alert/alert_test.go) — the
   threshold engine: sustained firing/resolve, immediate fire on `for = 0`,
@@ -1404,20 +1491,55 @@ way an operator does: HTTP requests, SIGHUP, SIGTERM, exit codes, and the
 
 It covers the served surface (static assets, `/api/*`, Prometheus, 503 before
 the first sample, 404s and the embedded filesystem's edges), `/api/series`
-shaping for all fourteen metrics with `cores=0`, `band=1` and range handling,
+shaping for all sixteen metrics with `cores=0`, `band=1` and range handling,
 SSE and WebSocket streaming including a dozen concurrent clients, the auth
 gate, the Unix-socket listener, the SQLite store (including alert events
 surviving a restart), SIGHUP reload and its refusal to apply a broken config,
 the alert engine end to end against a real webhook endpoint (raw, Slack and
 Discord payloads, the sampler watchdog, and failed deliveries reaching the
 log), `proc_watch`, every CLI subcommand and its `--json`, `check` exit codes,
-remote mode, and `beastied -t`.
+remote mode, `beastied -t` (including rules on a switched-off collector),
+and switching the optional collectors on and off with SIGHUP.
 
-The FreeBSD-only collectors (ZFS, jails, pf, temperatures) compile to stubs on
-Linux, so what the container proves is the portable surface plus that each of
-those panels explains its absence rather than printing nothing. Their parsers
-are unit-tested on any OS, and the FreeBSD-specific half — `rc.d`, `pkg(8)`,
-`newsyslog` — is exercised by installing the package on a FreeBSD host.
+The FreeBSD-only collectors (ZFS, jails, pf, temperatures, bhyve, host
+health) compile to stubs on Linux, so what the container proves is the
+portable surface plus that each of those panels explains its absence rather
+than printing nothing, and that a host-health rule reads *unknown* rather than
+0 when nothing was collected.
+
+#### FreeBSD end-to-end tests
+
+Unit tests can't catch everything here: two bugs only ever showed up against a
+FreeBSD `ps` (it reads `-o a=,b=` as one column, and it escapes characters in
+command lines). [`test/e2e/freebsd_test.go`](test/e2e/freebsd_test.go) runs
+those collectors against the real tools, with the daemon as `_beastie`:
+
+- **Host health** — `pkg audit` against generated `vuln.xml` files (one marking
+  `pkg` itself vulnerable, an empty one, a missing one), the kernel check
+  against `freebsd-version`, boot environments against `bectl`, alert rules,
+  Prometheus, and the standalone CLI as `_beastie`.
+- **bhyve** — a stand-in compiled with `cc` that titles itself like bhyve, so
+  `ps` shows it exactly as a real guest: names that `ps` escapes or pads, a busy
+  guest's CPU firing a rule, a guest exiting and coming back, and every
+  Prometheus line parsing. An orphaned `/dev/vmm` instance is tested where
+  `vmm.ko` works (it needs VT-x/AMD-V); elsewhere that case skips.
+- **ZFS and jails** — a pool on two files, mirrored: datasets, ARC, a scratch
+  jail, degrading and recovering the pool with its alert, and a scrub.
+
+It needs root to create the pool, jail and guests, and removes them
+afterwards. A test whose tooling is missing skips instead of failing. Boot
+environments are only compared, never created, so a ZFS-root host is the one
+place that branch reports real data.
+
+```sh
+gmake e2e-freebsd                          # on the FreeBSD host, as root
+E2E_HOST=root@freebsd-box gmake e2e-remote # from anywhere, over ssh
+```
+
+`e2e-remote` copies the working tree, uncommitted changes included, to a temp
+directory on the host, runs the suite there and deletes the directory. The
+host needs Go and key-based ssh. The other FreeBSD-specific pieces — `rc.d`,
+`pkg(8)`, `newsyslog` — are still exercised by installing the package.
 
 To iterate without rebuilding the image, run the same suite against the host's
 Go:

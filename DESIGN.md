@@ -199,7 +199,8 @@ beastiemon/
 ├── test/e2e/                        # end-to-end suite (`gmake e2e`)
 │   ├── Dockerfile                   # the container it runs in
 │   ├── harness_test.go              # daemon/CLI harness
-│   └── *_test.go                    # server, alerts, CLI cases (tag: e2e)
+│   ├── *_test.go                    # server, alerts, CLI cases (tag: e2e)
+│   └── freebsd_test.go              # real-tool collector cases (tags: e2e, freebsd; root)
 ├── Makefile                         # thin wrapper over scripts/ + test targets
 ├── .dockerignore                    # keeps build output out of both images
 ├── go.mod
@@ -307,7 +308,7 @@ dashboard.
 |-----------|--------|-----------|-------|
 | `cpu`     | `gopsutil/cpu.Times(true)` | none | per-core; computes deltas locally |
 | `mem`     | `gopsutil/mem.VirtualMemory` + `SwapMemory` | none | absolute values, not deltas |
-| `disk`    | `gopsutil/disk.IOCounters` | **`operator` group** | wraps `devstat(3)` |
+| `disk`    | `gopsutil/disk.IOCounters` | **`operator` group** | wraps `devstat(3)`; busy % and ms/op from the same counters |
 | `net`     | `gopsutil/net.IOCounters(true)` | none | honours `net_exclude` |
 | `fs`      | `gopsutil/disk.Partitions` + `Usage` | none | filtered by `fs_include`, dedupes mounts |
 | `temp`    | direct `unix.SysctlRaw` | none | FreeBSD-only build tag |
@@ -320,6 +321,8 @@ dashboard.
 | `jails`   | `jls` + `ps -axo jid=` (exec) | none | FreeBSD-only, opt-in; per-jail process count |
 | `pf`      | `pfctl -si` + `pfctl -sm` (exec) | **`/dev/pf` read** | FreeBSD-only, opt-in; state table + counter rates |
 | `watch`   | `gopsutil/process` names | none | only when `proc_watch` is set; per-name running count |
+| `vms`     | `ps -axww -o pid= -o rss= … -o args=` (exec, one `-o` per column) + `/dev/vmm` readdir | none | FreeBSD-only, opt-in (`bhyve`); CPU% diffed from cputime; vmm instance with no process = `orphaned` |
+| `health`  | `pkg audit -q`, `freebsd-version -r/-k/-u`, `bectl list -H` (exec) | none | FreeBSD-only, opt-in (`host_health`); **not per tick** — background goroutine every `host_health_interval` |
 
 The FreeBSD-only collectors are gated behind `[collect] zfs` / `jails` / `pf`
 (default off), because each shells out every tick. Their exec/sysctl wrappers
@@ -339,6 +342,29 @@ an incident, as opposed to the dozen malformed-packet counters beside them.
 "Rate" column, but it is a lifetime average since pf was enabled and says
 nothing about the present, so `PFCollector` keeps the previous counters and
 diffs them like every other rate in the project.
+
+**Host health is the first collector off the tick.** Everything else runs
+inside `Sampler.collect`, every interval. `pkg audit` and friends answer
+questions that change over days, and `pkg` can block on its database lock, so
+`HostHealthCollector` runs them in its own goroutine (bounded by a one-minute
+timeout per check) and the sampler copies the latest result into each
+snapshot. The first snapshot waits up to 3 s for the first result so a one-shot
+`beastie health` isn't always empty; a slower check lands in a later snapshot.
+Each part carries its own `Known` flag because "no vuln.xml" must read as
+unknown, never as zero vulnerable packages — the same rule as an unscrubbed
+pool's scan age.
+
+**bhyve names are read back exactly.** `ps` vis(3)-encodes `args` (a
+backslash prints as `\\`, a tab as `\011`, a control byte as `\^A`), and
+re-joining split fields would collapse runs of spaces. `parseBhyvePs` keeps the
+`args` column verbatim and `unvis` decodes it, because a name that came back
+altered would no longer match its `/dev/vmm` entry and the same guest would
+show up as both running and orphaned. Each `ps` column gets its own `-o`:
+FreeBSD treats everything after `=` as the header, commas included.
+
+**bhyve orphans are reported, not just guests.** A `/dev/vmm` entry with no
+bhyve process is a guest that exited without being destroyed; it still holds
+its wired memory and nothing else on the host points at it.
 
 **`proc_watch` exists because the top-N list cannot answer "is sshd running?"**
 An idle service never ranks by CPU, so its absence there is indistinguishable
@@ -549,7 +575,8 @@ resolution, older points from the (downsampled) store, merged by timestamp
   "net":  [{"iface": "em0", "rx_bps": 1258291.0, "tx_bps": 419430.4,
             "rx_pps": 850.0, "tx_pps": 420.0}],
   "disk": [{"dev": "ada0", "read_bps": 13002138.0, "write_bps": 5452595.2,
-            "read_iops": 124.0, "write_iops": 48.0}],
+            "read_iops": 124.0, "write_iops": 48.0,
+            "busy_pct": 37.5, "read_ms": 2.1, "write_ms": 6.4}],
   "fs":   [{"mount": "/", "dev": "/dev/ada0p2", "fstype": "ufs",
             "total": 68719476736, "used": 19541442150, "free": 49278034586,
             "used_pct": 28.4}],
@@ -590,10 +617,10 @@ Query parameters:
 
 | Parameter | Values | Default |
 |-----------|--------|---------|
-| `metric`  | `cpu` \| `mem` \| `load` \| `net` \| `neterr` \| `disk` \| `temp` \| `fs` \| `proc` \| `procwatch` \| `zfs` \| `arc` \| `jail` \| `pf` | `cpu` |
+| `metric`  | `cpu` \| `mem` \| `load` \| `net` \| `neterr` \| `disk` \| `disklat` \| `vm` \| `temp` \| `fs` \| `proc` \| `procwatch` \| `zfs` \| `arc` \| `jail` \| `pf` | `cpu` |
 | `range`   | Go duration (`15m`, `1h`) or integer seconds | `15m` |
 | `iface`   | NIC name (when `metric=net` or `neterr`) | sum all |
-| `dev`     | device name (when `metric=disk`) | sum all |
+| `dev`     | device name (when `metric=disk` or `disklat`) | sum all (`disklat`: worst device) |
 | `mount`   | mount point (when `metric=fs`) | all mounts |
 | `pid`     | process id (when `metric=proc`) | current top-N |
 | `pool`    | pool name (when `metric=zfs`) | all pools |
@@ -621,6 +648,11 @@ Notes:
 - `metric=neterr` is split out from `net` on purpose: error and drop rates
   share no useful axis with bytes/sec, and they are normally flat at zero, so
   folding them in would either squash the throughput line or hide them.
+- `metric=disklat` returns `busy_pct`, `read_ms`, `write_ms`. Unlike `disk`,
+  the unfiltered form takes the **worst device** per timestamp: busy
+  percentages and per-request times do not add, and the one saturated disk is
+  the answer to "is storage the bottleneck?". Kept apart from `disk` for the
+  same reason as `neterr` — no shared axis with bytes/sec.
 - `metric=procwatch` returns one running-count series per watched name, which
   is what turns "sshd is down" into "sshd went down at 03:14".
 - `cores=0` exists because the per-core columns dominate `metric=cpu` on a
@@ -1613,6 +1645,9 @@ shipped without restructuring, which is the evidence that the extension model
 | Tiered downsampling (coarse tier) | `store/sqlite.go` `coarsen` — §6, D19 |
 | CLI remote mode (`--remote`, incl. Unix socket) | `cmd/beastie` `fetchRemote` — §10, D20 |
 | `check net`/`check disk` | `cmd/beastie` `checkValue` — §10 |
+| Host-health panel (pkg audit, reboot required, boot environments) | `collect/hosthealth*.go`, background refresh, `host` alert metric, `beastie_pkg_vulnerable` — §5 |
+| bhyve VM panel (CPU, RSS, orphaned vmm instances) | `collect/bhyve*.go`, `/api/series` `vm`, `vm` alert metric, `beastie_vm_*` — §5, §7 |
+| Disk busy % + read/write latency | `collect/disk.go` `diskDelta`, `/api/series` `disklat`, `beastie_disk_busy_percent`/`_latency_ms` — §5, §7 |
 | NIC error/drop rates | `collect/net.go`, `/api/series` `neterr`, `beastie_net_errors` — §5, §7 |
 | ZFS scrub/resilver state + per-dataset usage | `collect/zfs.go`, `parseZpoolStatusScans` — §5 |
 | pf state table + counter rates | `collect/pf*.go`, `/api/series` `pf` — §5, §7 |

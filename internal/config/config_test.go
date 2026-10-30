@@ -24,6 +24,7 @@ func TestLoadNormalizesBadValues(t *testing.T) {
 interval = "0s"
 ring_size = 0
 top_procs = -1
+host_health_interval = "0s"
 
 [store]
 path = "/tmp/history.db"
@@ -46,6 +47,12 @@ resolution = "0s"
 	}
 	if cfg.Collect.TopProcs != def.Collect.TopProcs {
 		t.Errorf("top_procs not normalized: %d", cfg.Collect.TopProcs)
+	}
+	if cfg.Collect.HostHealthVulnXML != "/var/db/pkg/vuln.xml" {
+		t.Errorf("host_health_vulnxml default lost: %q", cfg.Collect.HostHealthVulnXML)
+	}
+	if cfg.Collect.HostHealthInterval.Duration != time.Hour {
+		t.Errorf("host_health_interval not normalized: %v", cfg.Collect.HostHealthInterval.Duration)
 	}
 	if cfg.Store.Retention.Duration != 30*24*time.Hour {
 		t.Errorf("retention not normalized: %v", cfg.Store.Retention.Duration)

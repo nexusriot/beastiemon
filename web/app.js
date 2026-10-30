@@ -206,6 +206,38 @@ function buildDiskChart(data) {
   state.resizers.disk = autoresize(state.charts.disk, el);
 }
 
+// buildDiskLatChart plots busy % on the left axis and per-request latency on
+// the right: they answer the same question ("is this disk the bottleneck?")
+// in units that share no scale. With no device selected each point is the
+// worst device, matching /api/series?metric=disklat.
+function buildDiskLatChart(data) {
+  const el = document.getElementById('chart-disklat');
+  if (state.charts.disklat) state.charts.disklat.destroy();
+
+  const [x, y] = axesFor(v => v.toFixed(0) + '%');
+  const [, yr] = axesFor(v => v.toFixed(1) + ' ms', 60);
+  y.scale = '%';
+  yr.scale = 'ms';
+  yr.side = 1;
+  yr.grid = { show: false };
+
+  const opts = makeOpts({
+    height: 160,
+    scales: { '%': { range: [0, 100] }, ms: { range: (u, lo, hi) => [0, Math.max(1, hi)] } },
+    series: [
+      {},
+      { label: 'Busy',    scale: '%',  stroke: COLORS.orange, fill: 'rgba(210,153,34,0.12)', width: 1.5 },
+      { label: 'Read ms', scale: 'ms', stroke: COLORS.cyan,   width: 1.5 },
+      { label: 'Write ms', scale: 'ms', stroke: COLORS.purple, width: 1.5 },
+    ],
+    axes: [x, y, yr],
+  });
+
+  state.charts.disklat = new uPlot(opts, data, el);
+  if (state.resizers.disklat) state.resizers.disklat.disconnect();
+  state.resizers.disklat = autoresize(state.charts.disklat, el);
+}
+
 
 async function fetchSeries(metric, extra = '') {
   const r = await fetch(`/api/series?metric=${metric}&range=${state.range}${extra}`);
@@ -236,8 +268,9 @@ async function loadNet(iface = '') {
 
 async function loadDisk(dev = '') {
   const extra = dev ? `&dev=${encodeURIComponent(dev)}` : '';
-  const d = await fetchSeries('disk', extra);
+  const [d, lat] = await Promise.all([fetchSeries('disk', extra), fetchSeries('disklat', extra)]);
   buildDiskChart(d.data);
+  buildDiskLatChart(lat.data);
 }
 
 async function loadAll() {
@@ -333,14 +366,18 @@ function applyLiveSnap(snap) {
   appendToChart(state.charts.net, ts, [rx, tx]);
 
   // Disk
-  let rd = 0, wr = 0;
+  let rd = 0, wr = 0, busy = 0, rms = 0, wms = 0;
   for (const d of (snap.disk || [])) {
     if (!state.diskDev || d.dev === state.diskDev) {
       rd += d.read_bps ?? 0;
       wr += d.write_bps ?? 0;
+      busy = Math.max(busy, d.busy_pct ?? 0);
+      rms = Math.max(rms, d.read_ms ?? 0);
+      wms = Math.max(wms, d.write_ms ?? 0);
     }
   }
   appendToChart(state.charts.disk, ts, [rd, wr]);
+  appendToChart(state.charts.disklat, ts, [busy, rms, wms]);
 
   // Uptime
   const uEl = document.getElementById('uptime-line');
@@ -358,6 +395,8 @@ function applyLiveSnap(snap) {
   // ZFS pools / ARC and jails (FreeBSD-only; cards hide when absent).
   renderZFS(snap.zfs || [], snap.arc);
   renderJails(snap.jails || []);
+  renderVMs(snap.vms || []);
+  renderHealth(snap.health);
 
   // Per-core distribution, pf, and watched processes.
   renderCores(snap.cpu?.per_core || []);
@@ -501,6 +540,79 @@ function renderJails(jails) {
     <thead><tr><th>JID</th><th>Name</th><th>Hostname</th><th class="proc-num">Procs</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+function renderVMs(vms) {
+  const card = document.getElementById('card-vms');
+  if (!card) return;
+  if (!vms.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const rows = vms.map(v => {
+    if (v.state !== 'running') {
+      // A vmm instance with no bhyve behind it still holds the guest's
+      // wired memory until someone destroys it.
+      return `<tr>
+        <td class="proc-name">${escapeHtml(v.name)}</td>
+        <td class="proc-cpu crit" colspan="4">orphaned — bhyvectl --destroy --vm=${escapeHtml(v.name)}</td>
+      </tr>`;
+    }
+    const cls = v.cpu_pct >= 90 ? 'crit' : v.cpu_pct >= 70 ? 'warn' : '';
+    return `<tr>
+      <td class="proc-name">${escapeHtml(v.name)}</td>
+      <td class="proc-pid">${v.pid}</td>
+      <td class="proc-num proc-cpu ${cls}">${(v.cpu_pct ?? 0).toFixed(1)}%</td>
+      <td class="proc-num">${humanBytes(v.rss)}</td>
+      <td class="proc-num">${humanDuration(v.uptime_sec || 0)}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('vms-grid').innerHTML = `<table class="proc-table">
+    <thead><tr><th>Name</th><th>PID</th><th class="proc-num">CPU</th><th class="proc-num">RSS</th><th class="proc-num">Uptime</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function ageLabel(hours) {
+  return hours >= 48 ? `${Math.round(hours / 24)}d` : `${Math.round(hours)}h`;
+}
+
+// renderHealth shows the slow host-health check. Each part renders only once
+// it has a result, and "unknown" is said out loud rather than shown as green.
+function renderHealth(h) {
+  const card = document.getElementById('card-health');
+  if (!card) return;
+  if (!h) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const rows = [];
+  if (!h.vuln_known) {
+    rows.push(['vulnerable packages', 'unknown (no vuln.xml)', 'warn']);
+  } else {
+    rows.push(['vulnerable packages', String(h.vulnerable), h.vulnerable > 0 ? 'crit' : 'ok']);
+    for (const p of (h.vuln_pkgs || [])) rows.push(['', p, 'sub']);
+    if (h.vulnerable > (h.vuln_pkgs || []).length) {
+      rows.push(['', `… ${h.vulnerable - h.vuln_pkgs.length} more`, 'sub']);
+    }
+    // periodic(8) refreshes vuln.xml daily; much older means it stopped.
+    rows.push(['vuln.xml age', ageLabel(h.vulndb_age_hours || 0), h.vulndb_age_hours > 72 ? 'warn' : '']);
+  }
+  if (h.kernel_known) {
+    rows.push(['kernel', h.reboot_required
+      ? `reboot required (${h.running_kernel} → ${h.installed_kernel})`
+      : h.running_kernel, h.reboot_required ? 'warn' : 'ok']);
+    if (h.userland) rows.push(['userland', h.userland, '']);
+  }
+  if (h.be_count) {
+    const pending = h.be_next && h.be_next !== h.be_active;
+    rows.push(['boot environment', `${h.be_active} (${h.be_count} total)`, '']);
+    if (pending) rows.push(['next boot', h.be_next, 'warn']);
+  }
+  const ago = Math.max(0, Date.now() / 1000 - Date.parse(h.checked_at) / 1000);
+  rows.push(['checked', humanDuration(ago) + ' ago', '']);
+
+  document.getElementById('health-grid').innerHTML = rows.map(([k, v, cls]) =>
+    `<div class="pf-row"><span class="pf-key">${escapeHtml(k)}</span><span class="pf-val ${cls}">${escapeHtml(v)}</span></div>`
+  ).join('');
 }
 
 

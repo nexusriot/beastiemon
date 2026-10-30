@@ -6,8 +6,8 @@
   <title>BeastieMon</title>
   <link rel="stylesheet" href="style.css">
   <!-- uPlot — fetch offline copy via `make vendor-js` -->
-  <script src="https://unpkg.com/uplot@1.6.27/dist/uPlot.iife.min.js"></script>
-  <link  rel="stylesheet" href="https://unpkg.com/uplot@1.6.27/dist/uPlot.min.css">
+  <script src="vendor/uplot.iife.min.js"></script>
+  <link  rel="stylesheet" href="vendor/uplot.min.css">
 </head>
 <body>
   <header>
@@ -99,6 +99,12 @@
         <div class="iface-tabs" id="dev-tabs"></div>
       </div>
 
+      <div class="card span2" id="card-disklat">
+        <h2>Disk Busy &amp; Latency
+          <button class="card-act" data-export="disklat" title="Download this chart as CSV">⤓</button></h2>
+        <div id="chart-disklat"></div>
+      </div>
+
       <div class="card" id="card-temp">
         <h2>Temperatures</h2>
         <div id="temp-grid"></div>
@@ -139,6 +145,16 @@
       <div class="card span2" id="card-jails" style="display:none">
         <h2>Jails</h2>
         <div id="jails-grid"></div>
+      </div>
+
+      <div class="card span2" id="card-vms" style="display:none">
+        <h2>bhyve VMs</h2>
+        <div id="vms-grid"></div>
+      </div>
+
+      <div class="card span2" id="card-health" style="display:none">
+        <h2>Host Health</h2>
+        <div id="health-grid"></div>
       </div>
     </div>
   </main>

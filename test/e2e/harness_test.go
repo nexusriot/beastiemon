@@ -51,6 +51,11 @@ func run(m *testing.M) (int, error) {
 			return 0, err
 		}
 		defer os.RemoveAll(dir)
+		// The FreeBSD tests run the daemon as _beastie, which has to be able
+		// to reach the binaries.
+		if err := os.Chmod(dir, 0o755); err != nil {
+			return 0, err
+		}
 		for _, c := range []struct {
 			name string
 			dst  *string
@@ -130,7 +135,23 @@ func startDaemon(t *testing.T, cfg string) *daemon {
 // address — a wildcard bind, or a Unix socket path.
 func startDaemonAt(t *testing.T, addr, cfg string) *daemon {
 	t.Helper()
+	return startDaemonOpts(t, addr, cfg, daemonOpts{})
+}
+
+// daemonOpts are the rarely needed knobs of startDaemonOpts.
+type daemonOpts struct {
+	// cred runs beastied as another user, the way rc.d runs it as _beastie,
+	// so a test sees the permissions an installed daemon has. The config
+	// then lives in a world-readable directory instead of t.TempDir.
+	cred *syscall.Credential
+}
+
+func startDaemonOpts(t *testing.T, addr, cfg string, opts daemonOpts) *daemon {
+	t.Helper()
 	dir := t.TempDir()
+	if opts.cred != nil {
+		dir = sharedTempDir(t)
+	}
 	cfgPath := filepath.Join(dir, "beastiemon.conf")
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		t.Fatalf("writing config: %v", err)
@@ -146,6 +167,9 @@ func startDaemonAt(t *testing.T, addr, cfg string) *daemon {
 	d.client, d.baseURL = clientFor(addr)
 
 	d.cmd = exec.Command(beastiedBin, "-config", cfgPath)
+	if opts.cred != nil {
+		d.cmd.SysProcAttr = &syscall.SysProcAttr{Credential: opts.cred}
+	}
 	d.cmd.Stdout = d.logs
 	d.cmd.Stderr = d.logs
 	if err := d.cmd.Start(); err != nil {
@@ -159,6 +183,21 @@ func startDaemonAt(t *testing.T, addr, cfg string) *daemon {
 
 	d.waitReady()
 	return d
+}
+
+// sharedTempDir is a temp directory other users can read, for files a daemon
+// running as another user must open. t.TempDir is 0700 all the way down.
+func sharedTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "beastiemon-e2e-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
 }
 
 // clientFor builds the HTTP client for a TCP address or a Unix socket path.
@@ -317,7 +356,16 @@ func (d *daemon) cli(args ...string) (stdout, stderr string, code int) {
 
 func runCLI(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
+	return runCLIAs(t, nil, args...)
+}
+
+// runCLIAs is runCLI as another user (nil: the test's own).
+func runCLIAs(t *testing.T, cred *syscall.Credential, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
 	cmd := exec.Command(beastieBin, args...)
+	if cred != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -359,6 +407,19 @@ func truncate(b []byte) string {
 		return string(b[:max]) + "…"
 	}
 	return string(b)
+}
+
+// waitFor polls cond until it holds or within passes, and reports whether it
+// held — for state that settles over several samples.
+func waitFor(within time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return cond()
 }
 
 // baseConfig is a fast-sampling daemon with nothing optional turned on.

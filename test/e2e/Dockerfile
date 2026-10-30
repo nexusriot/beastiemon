@@ -8,8 +8,8 @@
 # The daemon's FreeBSD-only collectors (ZFS, jails, pf, temperatures) compile
 # to stubs here, so what this proves is the portable surface: the HTTP API,
 # streaming, auth, the store, the alert engine, the CLI, and config handling.
-# The FreeBSD-specific half — rc.d, pkg(8), those collectors — is covered by
-# the unit tests and by installing the package on a FreeBSD host.
+# Those collectors run for real in freebsd_test.go (`make e2e-freebsd` /
+# `make e2e-remote`); rc.d and pkg(8) by installing the package on FreeBSD.
 FROM golang:1.23-bookworm
 
 WORKDIR /src

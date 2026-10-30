@@ -1,6 +1,7 @@
 package collect
 
 import (
+	"math"
 	"sort"
 	"time"
 
@@ -30,13 +31,7 @@ func (d *DiskCollector) Collect() []DiskStats {
 			if !ok {
 				continue
 			}
-			stats = append(stats, DiskStats{
-				Device:    name,
-				ReadBps:   round2(deltaU64(cur.ReadBytes, p.ReadBytes) / dt),
-				WriteBps:  round2(deltaU64(cur.WriteBytes, p.WriteBytes) / dt),
-				ReadIOPS:  round2(deltaU64(cur.ReadCount, p.ReadCount) / dt),
-				WriteIOPS: round2(deltaU64(cur.WriteCount, p.WriteCount) / dt),
-			})
+			stats = append(stats, diskDelta(name, cur, p, dt))
 		}
 	}
 
@@ -47,4 +42,32 @@ func (d *DiskCollector) Collect() []DiskStats {
 	d.prev = counters
 	d.prevAt = now
 	return stats
+}
+
+// diskDelta turns two counter readings dt seconds apart into rates. gopsutil
+// reports ReadTime, WriteTime and IoTime in milliseconds on both FreeBSD
+// (devstat durations and busy_time) and Linux (/proc/diskstats).
+func diskDelta(name string, cur, prev psutil.IOCountersStat, dt float64) DiskStats {
+	reads := deltaU64(cur.ReadCount, prev.ReadCount)
+	writes := deltaU64(cur.WriteCount, prev.WriteCount)
+	return DiskStats{
+		Device:    name,
+		ReadBps:   round2(deltaU64(cur.ReadBytes, prev.ReadBytes) / dt),
+		WriteBps:  round2(deltaU64(cur.WriteBytes, prev.WriteBytes) / dt),
+		ReadIOPS:  round2(reads / dt),
+		WriteIOPS: round2(writes / dt),
+		// Busy time can run a hair past wall time when the two readings
+		// straddle the tick unevenly, so clamp to what gstat would show.
+		BusyPct: round2(math.Min(100, deltaU64(cur.IoTime, prev.IoTime)/(dt*1000)*100)),
+		ReadMs:  round2(perOp(deltaU64(cur.ReadTime, prev.ReadTime), reads)),
+		WriteMs: round2(perOp(deltaU64(cur.WriteTime, prev.WriteTime), writes)),
+	}
+}
+
+// perOp is total/ops, or 0 for an idle interval rather than NaN.
+func perOp(total, ops float64) float64 {
+	if ops == 0 {
+		return 0
+	}
+	return total / ops
 }

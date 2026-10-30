@@ -151,8 +151,8 @@ func TestSeries(t *testing.T) {
 		// collectors are FreeBSD-only: on Linux they report no entries rather
 		// than failing, which is what keeps the dashboard's cards honest.
 		for _, m := range []string{
-			"cpu", "mem", "load", "net", "neterr", "disk", "temp", "fs",
-			"proc", "procwatch", "zfs", "arc", "jail", "pf",
+			"cpu", "mem", "load", "net", "neterr", "disk", "disklat", "temp", "fs",
+			"proc", "procwatch", "zfs", "arc", "jail", "pf", "vm",
 		} {
 			var s series
 			d.getJSON("/api/series?metric="+m+"&range=5m", &s)
@@ -244,6 +244,17 @@ func TestPrometheusExposition(t *testing.T) {
 	}
 	if help != typ || help == 0 {
 		t.Errorf("%d HELP lines against %d TYPE lines", help, typ)
+	}
+	// Busy and latency ride along with throughput for every device, so a
+	// host that reports disks at all must report all four families.
+	if strings.Contains(text, "beastie_disk_bps{") {
+		for _, want := range []string{
+			"beastie_disk_iops{", "beastie_disk_busy_percent{", "beastie_disk_latency_ms{",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("/metrics has disk throughput but no %s", want)
+			}
+		}
 	}
 }
 

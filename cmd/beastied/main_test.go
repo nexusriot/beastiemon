@@ -34,6 +34,30 @@ func TestUnwatchedProcRules(t *testing.T) {
 	}
 }
 
+func TestDisabledCollectorRules(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Collect.ZFS = true
+	cfg.Alerts.Rules = []config.AlertRule{
+		{Name: "pool", Metric: "zfs", Field: "health", Op: ">=", Threshold: 1},
+		{Name: "arc", Metric: "arc", Op: "<", Threshold: 80},
+		// With bhyve off this reads 0 and would fire, which is the point.
+		{Name: "vms-down", Metric: "vm", Field: "count", Op: "<", Threshold: 2},
+		{Name: "jails-down", Metric: "jail", Field: "count", Op: "<", Threshold: 1},
+		{Name: "pkgs", Metric: "host", Op: ">", Threshold: 0},
+		{Name: "cpu", Metric: "cpu", Op: ">", Threshold: 90},
+	}
+
+	warns := disabledCollectorRules(cfg)
+	if len(warns) != 3 {
+		t.Fatalf("want warnings for vm, jail and host only, got %d: %v", len(warns), warns)
+	}
+	for i, want := range []string{"bhyve", "jails", "host_health"} {
+		if !contains(warns[i], "[collect] "+want+" = true") {
+			t.Errorf("warning %d should name the switch %q: %q", i, want, warns[i])
+		}
+	}
+}
+
 func TestTestConfigExitCodes(t *testing.T) {
 	good := config.Default()
 	if code := testConfig("test.conf", good); code != 0 {

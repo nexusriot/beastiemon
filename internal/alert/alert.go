@@ -513,11 +513,18 @@ func metricValue(snap collect.Snapshot, metric, field string) (float64, bool) {
 		if !ok || len(snap.Disk) == 0 {
 			return 0, false
 		}
-		var sum float64
+		// Throughput sums across devices; busy and latency take the worst
+		// device, since one saturated disk is the incident and summing
+		// percentages or per-request times is meaningless.
+		var agg float64
 		for _, d := range snap.Disk {
-			sum += get(d)
+			if diskWorstFields[field] {
+				agg = max(agg, get(d))
+			} else {
+				agg += get(d)
+			}
 		}
-		return sum, true
+		return agg, true
 	case "net":
 		get, ok := netField(field)
 		if !ok || len(snap.Net) == 0 {
@@ -586,8 +593,62 @@ func metricValue(snap collect.Snapshot, metric, field string) (float64, bool) {
 		case "insert_rate":
 			return snap.PF.InsertRate, true
 		}
+	case "host":
+		return hostValue(snap.Health, field)
+	case "vm":
+		switch field {
+		case "", "count":
+			// Like jail.count, always readable: zero running guests is the
+			// fact a "my VMs died" rule needs.
+			return float64(countVMs(snap.VMs, "running")), true
+		case "orphaned":
+			return float64(countVMs(snap.VMs, "orphaned")), true
+		}
+		for _, v := range snap.VMs {
+			if v.Name == field && v.State == "running" {
+				return v.CPUPct, true
+			}
+		}
+		return 0, false
 	}
 	return 0, false
+}
+
+// hostValue reads a host-health field. Each part reads unknown until its
+// check has succeeded, so a host without vuln.xml can't pass for "0
+// vulnerable packages".
+func hostValue(h *collect.HostHealth, field string) (float64, bool) {
+	if h == nil {
+		return 0, false
+	}
+	switch field {
+	case "", "vulnerable":
+		return float64(h.Vulnerable), h.VulnKnown
+	case "vulndb_age_hours":
+		return h.VulnDBAgeHours, h.VulnKnown
+	case "reboot_required":
+		return boolValue(h.RebootRequired), h.KernelKnown
+	case "be_pending":
+		return boolValue(h.BEPending()), h.BECount > 0
+	}
+	return 0, false
+}
+
+func boolValue(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func countVMs(vms []collect.VMStat, state string) int {
+	n := 0
+	for _, v := range vms {
+		if v.State == state {
+			n++
+		}
+	}
+	return n
 }
 
 // zfsValue reduces a per-pool field to its worst case across all pools.
@@ -658,14 +719,18 @@ var metricFields = map[string][]string{
 	"mem":  {"", "used_pct", "used", "free"},
 	"swap": {"", "pct", "used"},
 	"load": {"", "load1", "load5", "load15"},
-	"disk": {"", "read_bps", "write_bps", "read_iops", "write_iops", "total_bps", "total_iops"},
+	"disk": {"", "read_bps", "write_bps", "read_iops", "write_iops", "total_bps", "total_iops",
+		"busy_pct", "read_ms", "write_ms", "latency_ms"},
 	"net": {"", "rx_bps", "tx_bps", "rx_pps", "tx_pps", "total_bps",
 		"rx_err", "tx_err", "err", "rx_drop", "tx_drop", "drop"},
 	"zfs":  {"", "used_pct", "health", "scan_pct", "scan_age_hours"},
 	"arc":  {"", "hit_rate", "size", "target"},
 	"pf":   {"", "state_pct", "states", "drop_rate", "match_rate", "search_rate", "insert_rate"},
+	"host": {"", "vulnerable", "vulndb_age_hours", "reboot_required", "be_pending"},
 	"fs":   nil,
 	"temp": nil,
+	// vm accepts "count", "orphaned", or a guest name (its CPU%).
+	"vm": nil,
 	// jail accepts "count" or a jail name, so it is keyed like fs/temp.
 	"jail": nil,
 	// proc is keyed too, but unlike the others an empty field is useless:
@@ -748,6 +813,9 @@ func contains(list []string, v string) bool {
 	return false
 }
 
+// diskWorstFields are the disk fields aggregated by max rather than sum.
+var diskWorstFields = map[string]bool{"busy_pct": true, "read_ms": true, "write_ms": true, "latency_ms": true}
+
 func diskField(field string) (func(collect.DiskStats) float64, bool) {
 	switch field {
 	case "", "read_bps":
@@ -762,6 +830,14 @@ func diskField(field string) (func(collect.DiskStats) float64, bool) {
 		return func(d collect.DiskStats) float64 { return d.ReadBps + d.WriteBps }, true
 	case "total_iops":
 		return func(d collect.DiskStats) float64 { return d.ReadIOPS + d.WriteIOPS }, true
+	case "busy_pct":
+		return func(d collect.DiskStats) float64 { return d.BusyPct }, true
+	case "read_ms":
+		return func(d collect.DiskStats) float64 { return d.ReadMs }, true
+	case "write_ms":
+		return func(d collect.DiskStats) float64 { return d.WriteMs }, true
+	case "latency_ms":
+		return func(d collect.DiskStats) float64 { return max(d.ReadMs, d.WriteMs) }, true
 	}
 	return nil, false
 }

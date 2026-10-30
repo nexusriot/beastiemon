@@ -83,14 +83,18 @@ func bar(pct float64, width int) string {
 	if filled < 0 || math.IsNaN(pct) {
 		filled = 0
 	}
-	colour := green
+	return pctColor(pct) + strings.Repeat("█", filled) + gray + strings.Repeat("░", width-filled) + reset
+}
+
+// pctColor is the shared green/yellow/red scale for utilisation percentages.
+func pctColor(pct float64) string {
 	switch {
 	case pct >= 90:
-		colour = red
+		return red
 	case pct >= 70:
-		colour = yellow
+		return yellow
 	}
-	return colour + strings.Repeat("█", filled) + gray + strings.Repeat("░", width-filled) + reset
+	return green
 }
 
 // humanBytes formats bytes as human-readable.
@@ -128,13 +132,7 @@ func printCPU(snap collect.Snapshot) {
 	if len(c.PerCore) > 0 {
 		fmt.Print(gray + "        cores: " + reset)
 		for i, v := range c.PerCore {
-			col := green
-			if v >= 90 {
-				col = red
-			} else if v >= 70 {
-				col = yellow
-			}
-			fmt.Printf("%scpu%d:%s%.0f%%%s ", col, i, reset, v, reset)
+			fmt.Printf("%scpu%d:%s%.0f%%%s ", pctColor(v), i, reset, v, reset)
 		}
 		fmt.Println()
 	}
@@ -221,7 +219,7 @@ func scanSummary(z collect.ZFSStats) string {
 	return ""
 }
 
-// humanHours renders a scrub age at the resolution an operator cares about.
+// humanHours renders an age (scrub, vuln.xml) at the resolution an operator cares about.
 func humanHours(h float64) string {
 	if h >= 48 {
 		return fmt.Sprintf("%.0fd", h/24)
@@ -234,6 +232,55 @@ func printJails(snap collect.Snapshot) {
 		fmt.Printf(bold+"JAIL"+reset+"    %-4d %-16s %-24s "+gray+"%d procs"+reset+"\n",
 			j.JID, j.Name, j.Host, j.Procs)
 	}
+}
+
+func printVMs(snap collect.Snapshot) {
+	for _, v := range snap.VMs {
+		if v.State != "running" {
+			fmt.Printf(bold+"VM"+reset+"      %-16s "+red+"orphaned"+reset+" "+gray+"(vmm instance with no bhyve process — bhyvectl --destroy --vm=%s)"+reset+"\n",
+				v.Name, v.Name)
+			continue
+		}
+		fmt.Printf(bold+"VM"+reset+"      %-16s cpu:%s%6.1f%%"+reset+"  rss:%-10s "+gray+"pid %d, up %s"+reset+"\n",
+			v.Name, pctColor(v.CPUPct), v.CPUPct, humanBytes(v.RSS), v.PID, humanDuration(v.UptimeSec))
+	}
+}
+
+func printHealth(snap collect.Snapshot) {
+	h := snap.Health
+	if h == nil {
+		fmt.Println(gray + "HEALTH  (no result — needs [collect] host_health = true; first check may still be running)" + reset)
+		return
+	}
+	switch {
+	case !h.VulnKnown:
+		fmt.Println(bold + "PKG" + reset + "     " + yellow + "unknown" + reset + gray + " (no vuln.xml — run pkg audit -F, or enable periodic security)" + reset)
+	case h.Vulnerable == 0:
+		fmt.Printf(bold+"PKG"+reset+"     "+green+"no vulnerable packages"+reset+gray+"  vuln.xml %s old"+reset+"\n", humanHours(h.VulnDBAgeHours))
+	default:
+		fmt.Printf(bold+"PKG"+reset+"     "+red+"%d vulnerable"+reset+gray+"  vuln.xml %s old"+reset+"\n", h.Vulnerable, humanHours(h.VulnDBAgeHours))
+		for _, p := range h.VulnPkgs {
+			fmt.Println("        " + p)
+		}
+		if extra := h.Vulnerable - len(h.VulnPkgs); extra > 0 {
+			fmt.Printf(gray+"        … and %d more (pkg audit)"+reset+"\n", extra)
+		}
+	}
+	if h.KernelKnown {
+		if h.RebootRequired {
+			fmt.Printf(bold+"KERNEL"+reset+"  "+yellow+"reboot required"+reset+"  running %s, installed %s\n", h.RunningKernel, h.InstalledKernel)
+		} else {
+			fmt.Printf(bold+"KERNEL"+reset+"  "+green+"%s"+reset+gray+"  userland %s"+reset+"\n", h.RunningKernel, h.Userland)
+		}
+	}
+	if h.BECount > 0 {
+		next := ""
+		if h.BEPending() {
+			next = "  " + yellow + "next boot: " + h.BENext + reset
+		}
+		fmt.Printf(bold+"BE"+reset+"      %s"+gray+"  (%d environments)"+reset+"%s\n", h.BEActive, h.BECount, next)
+	}
+	fmt.Printf(gray+"        checked %s ago"+reset+"\n", humanDuration(uint64(time.Since(h.CheckedAt).Seconds())))
 }
 
 func printPF(snap collect.Snapshot) {
@@ -289,11 +336,12 @@ func printDisk(snap collect.Snapshot) {
 	disks := append([]collect.DiskStats(nil), snap.Disk...)
 	sort.Slice(disks, func(i, j int) bool { return disks[i].Device < disks[j].Device })
 	for _, d := range disks {
-		fmt.Printf(bold+"DISK"+reset+"    %-8s  R:"+cyan+"%-12s"+reset+" W:"+yellow+"%-12s"+reset+" "+gray+"riops:%.0f wiops:%.0f"+reset+"\n",
+		fmt.Printf(bold+"DISK"+reset+"    %-8s  R:"+cyan+"%-12s"+reset+" W:"+yellow+"%-12s"+reset+" "+gray+"riops:%.0f wiops:%.0f"+reset+"  busy:%s%5.1f%%"+reset+" "+gray+"r:%.1fms w:%.1fms"+reset+"\n",
 			d.Device,
 			humanBytes(uint64(d.ReadBps))+"/s",
 			humanBytes(uint64(d.WriteBps))+"/s",
-			d.ReadIOPS, d.WriteIOPS)
+			d.ReadIOPS, d.WriteIOPS,
+			pctColor(d.BusyPct), d.BusyPct, d.ReadMs, d.WriteMs)
 	}
 }
 
@@ -376,6 +424,12 @@ func printAll(snap collect.Snapshot) {
 	if snap.PF != nil {
 		printPF(snap)
 	}
+	if len(snap.VMs) > 0 {
+		printVMs(snap)
+	}
+	if snap.Health != nil {
+		printHealth(snap)
+	}
 	if len(snap.Watch) > 0 {
 		printWatch(snap)
 	}
@@ -391,6 +445,7 @@ var metricCommands = map[string]bool{
 	// Opt-in subsystems. These print an explanatory line rather than
 	// nothing when the matching [collect] switch is off.
 	"zfs": true, "jail": true, "pf": true, "watch": true,
+	"vm": true, "health": true,
 }
 
 // emitJSON prints the part of the snapshot relevant to cmd as indented JSON.
@@ -428,6 +483,10 @@ func emitJSON(cmd string, snap collect.Snapshot) {
 		enc.Encode(snap.PF)
 	case "watch":
 		enc.Encode(snap.Watch)
+	case "vm":
+		enc.Encode(snap.VMs)
+	case "health":
+		enc.Encode(snap.Health)
 	default: // status
 		enc.Encode(snap)
 	}
@@ -799,6 +858,8 @@ var checkDefaults = map[string]checkDefault{
 	"arc":  {"hit_rate", "arc.hit_rate%"},
 	"jail": {"count", "jail.count"},
 	"pf":   {"state_pct", "pf.state_pct%"},
+	"host": {"vulnerable", "host.vulnerable"},
+	"vm":   {"count", "vm.count"},
 	// proc has no sensible default: there is no "worst process", only the
 	// one you named. An empty field falls through to the unknown-field path.
 	"proc": {"", "proc"},
@@ -925,6 +986,8 @@ func usage() {
 	fmt.Printf("  %-10s  %s\n", "jail", "running jails")
 	fmt.Printf("  %-10s  %s\n", "pf", "pf state table and counters")
 	fmt.Printf("  %-10s  %s\n", "watch", "watched processes (proc_watch)")
+	fmt.Printf("  %-10s  %s\n", "vm", "bhyve guests")
+	fmt.Printf("  %-10s  %s\n", "health", "pkg audit, pending reboot, boot environments")
 	fmt.Printf("  %-10s  %s\n", "top", "continuous refresh (Ctrl-C to quit)")
 	fmt.Printf("  %-10s  %s\n", "check", "nagios-style threshold check (exit 0/1/2/3)")
 	fmt.Printf("  %-10s  %s\n", "alerts", "rule states from a running daemon (needs --remote)")
@@ -1115,6 +1178,14 @@ func main() {
 			}
 		case "pf":
 			printPF(snap)
+		case "vm":
+			if len(snap.VMs) == 0 {
+				fmt.Println(gray + "VM      (no bhyve guests — needs [collect] bhyve = true)" + reset)
+			} else {
+				printVMs(snap)
+			}
+		case "health":
+			printHealth(snap)
 		case "watch":
 			if len(snap.Watch) == 0 {
 				fmt.Println(gray + "WATCH   (nothing watched — set [collect] proc_watch)" + reset)

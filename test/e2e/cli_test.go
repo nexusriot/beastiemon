@@ -17,7 +17,7 @@ func TestCLISubcommands(t *testing.T) {
 
 	commands := []string{
 		"status", "cpu", "mem", "net", "disk", "fs", "temp",
-		"proc", "load", "zfs", "jail", "pf", "watch",
+		"proc", "load", "zfs", "jail", "pf", "watch", "vm", "health",
 	}
 
 	t.Run("local sampling", func(t *testing.T) {
@@ -50,11 +50,13 @@ func TestCLISubcommands(t *testing.T) {
 		// None of these collectors exist off FreeBSD, so each one is a chance
 		// to print a confusing blank.
 		for cmd, want := range map[string]string{
-			"zfs":   "no pools",
-			"jail":  "no jails",
-			"pf":    "unavailable",
-			"watch": "nothing watched",
-			"temp":  "unavailable",
+			"zfs":    "no pools",
+			"jail":   "no jails",
+			"pf":     "unavailable",
+			"watch":  "nothing watched",
+			"temp":   "unavailable",
+			"vm":     "no bhyve guests",
+			"health": "no result",
 		} {
 			out, _, _ := d.cli(cmd)
 			if !strings.Contains(strings.ToLower(out), want) {
@@ -78,7 +80,7 @@ func TestCLIJSON(t *testing.T) {
 
 	for _, c := range []string{
 		"", "cpu", "mem", "net", "disk", "fs", "temp", "proc",
-		"load", "zfs", "jail", "pf", "watch",
+		"load", "zfs", "jail", "pf", "watch", "vm", "health",
 	} {
 		args := []string{"--json"}
 		name := c
@@ -328,6 +330,20 @@ func TestDaemonConfigTest(t *testing.T) {
 			cfg: "[alerts]\n[[alerts.rule]]\nname = \"svc\"\nmetric = \"proc\"\n" +
 				"field = \"nginx\"\nop = \"<\"\nthreshold = 1\n",
 			want: 1, expect: []string{"proc_watch", "never fire"},
+		},
+		{
+			// With bhyve off, vm.count reads 0, so this rule would fire on a
+			// host that merely isn't collecting guests.
+			name: "rule on a switched-off collector",
+			cfg: "[alerts]\n[[alerts.rule]]\nname = \"vms-down\"\nmetric = \"vm\"\n" +
+				"field = \"count\"\nop = \"<\"\nthreshold = 2\n",
+			want: 1, expect: []string{"vms-down", "[collect] bhyve = true"},
+		},
+		{
+			name: "same rule with its collector on",
+			cfg: "[collect]\nbhyve = true\n\n[alerts]\n[[alerts.rule]]\nname = \"vms-down\"\n" +
+				"metric = \"vm\"\nfield = \"count\"\nop = \"<\"\nthreshold = 2\n",
+			want: 0, expect: []string{"syntax ok"},
 		},
 		{
 			name: "malformed toml",

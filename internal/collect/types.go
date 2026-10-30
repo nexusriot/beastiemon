@@ -28,6 +28,12 @@ type Snapshot struct {
 	// PF is packet-filter state, present only with [collect] pf and a
 	// readable /dev/pf.
 	PF *PFStats `json:"pf,omitempty"`
+	// Health is the slow host-health check ([collect] host_health): pkg
+	// audit, pending kernel reboot, boot environments. It refreshes on its own
+	// interval, so consecutive snapshots carry the same value until then.
+	Health *HostHealth `json:"health,omitempty"`
+	// VMs are bhyve guests, present only with [collect] bhyve.
+	VMs []VMStat `json:"vms,omitempty"`
 }
 
 type CPUStats struct {
@@ -66,12 +72,21 @@ type NetStats struct {
 	TxDrop    float64 `json:"tx_drop,omitempty"`
 }
 
+// DiskStats is per-device I/O. BusyPct and the latencies come from the same
+// devstat(3) counters as throughput, so they cost nothing extra: BusyPct is
+// the share of the interval the device had at least one request outstanding
+// (gstat's %busy), and ReadMs/WriteMs are the mean service time per completed
+// request (gstat's ms/r, ms/w). Latency is 0 when no requests of that kind
+// completed during the interval.
 type DiskStats struct {
 	Device    string  `json:"dev"`
 	ReadBps   float64 `json:"read_bps"`
 	WriteBps  float64 `json:"write_bps"`
 	ReadIOPS  float64 `json:"read_iops"`
 	WriteIOPS float64 `json:"write_iops"`
+	BusyPct   float64 `json:"busy_pct"`
+	ReadMs    float64 `json:"read_ms"`
+	WriteMs   float64 `json:"write_ms"`
 }
 
 type FSStats struct {
@@ -178,4 +193,50 @@ type JailStat struct {
 	Host  string `json:"host,omitempty"`
 	Path  string `json:"path,omitempty"`
 	Procs int    `json:"procs"`
+}
+
+// HostHealth is the result of one host-health check. Each part has its own
+// Known flag because they fail independently: a host may have no vuln.xml
+// yet, or not boot from ZFS, and that must read "unknown", not "healthy".
+type HostHealth struct {
+	CheckedAt time.Time `json:"checked_at"`
+
+	// From `pkg audit -q` against the local vuln.xml. The daemon never
+	// fetches the database itself (no outbound network); periodic(8)'s
+	// daily security run refreshes it.
+	VulnKnown      bool     `json:"vuln_known"`
+	Vulnerable     int      `json:"vulnerable"`
+	VulnPkgs       []string `json:"vuln_pkgs,omitempty"`
+	VulnDBAgeHours float64  `json:"vulndb_age_hours,omitempty"`
+
+	// From freebsd-version(1). A newer installed kernel than the running
+	// one means an update was installed and the host was never rebooted.
+	KernelKnown     bool   `json:"kernel_known"`
+	RunningKernel   string `json:"running_kernel,omitempty"`
+	InstalledKernel string `json:"installed_kernel,omitempty"`
+	Userland        string `json:"userland,omitempty"`
+	RebootRequired  bool   `json:"reboot_required"`
+
+	// From `bectl list -H`; zero on a host that doesn't boot from ZFS.
+	BECount  int    `json:"be_count,omitempty"`
+	BEActive string `json:"be_active,omitempty"`
+	BENext   string `json:"be_next,omitempty"`
+}
+
+// BEPending reports whether the next boot selects a different boot
+// environment than the running one — an upgrade staged with bectl activate.
+func (h *HostHealth) BEPending() bool {
+	return h.BECount > 0 && h.BENext != "" && h.BENext != h.BEActive
+}
+
+// VMStat is one bhyve guest. State is "running" for a live bhyve process and
+// "orphaned" for a /dev/vmm instance with no process behind it: a guest that
+// exited without `bhyvectl --destroy` and still holds its wired memory.
+type VMStat struct {
+	Name      string  `json:"name"`
+	State     string  `json:"state"`
+	PID       int32   `json:"pid,omitempty"`
+	CPUPct    float64 `json:"cpu_pct"`
+	RSS       uint64  `json:"rss"`
+	UptimeSec uint64  `json:"uptime_sec,omitempty"`
 }

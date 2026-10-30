@@ -655,3 +655,114 @@ func TestSeriesTimestampsSurviveABackwardClockStep(t *testing.T) {
 		}
 	}
 }
+
+func diskLatSnap(t time.Time) collect.Snapshot {
+	snap := sampleSnap(t)
+	snap.Disk = []collect.DiskStats{
+		{Device: "ada0", ReadIOPS: 10, WriteIOPS: 4, BusyPct: 20, ReadMs: 0.5, WriteMs: 9},
+		{Device: "nda0", ReadIOPS: 300, WriteIOPS: 2, BusyPct: 85, ReadMs: 3, WriteMs: 1},
+	}
+	return snap
+}
+
+func TestSeriesDiskLatWorstDevice(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	s.Ingest(diskLatSnap(time.Now()))
+
+	labels, data := seriesOf(t, s, "/api/series?metric=disklat&range=1h")
+	want := []string{"ts", "busy_pct", "read_ms", "write_ms"}
+	if strings.Join(labels, ",") != strings.Join(want, ",") {
+		t.Fatalf("labels: want %v, got %v", want, labels)
+	}
+	// Each column is the worst device, not a sum: summing busy % would
+	// report 105 % for two disks that are each under capacity.
+	if data[1][0] != 85 || data[2][0] != 3 || data[3][0] != 9 {
+		t.Fatalf("want busy 85, read 3, write 9, got %v", data)
+	}
+
+	_, data = seriesOf(t, s, "/api/series?metric=disklat&range=1h&dev=ada0")
+	if data[1][0] != 20 || data[2][0] != 0.5 {
+		t.Fatalf("dev=ada0: want busy 20, read 0.5, got %v", data)
+	}
+}
+
+func TestPrometheusDiskLatency(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	s.Ingest(diskLatSnap(time.Now()))
+
+	body := get(s, "/metrics", nil).Body.String()
+	for _, want := range []string{
+		`beastie_disk_iops{dev="nda0",dir="read"} 300`,
+		`beastie_disk_busy_percent{dev="nda0"} 85`,
+		`beastie_disk_latency_ms{dev="ada0",dir="write"} 9`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("exposition missing %q", want)
+		}
+	}
+}
+
+func bsdHostSnap(t time.Time, webCPU float64) collect.Snapshot {
+	snap := sampleSnap(t)
+	snap.VMs = []collect.VMStat{
+		{Name: "old", State: "orphaned"},
+		{Name: "web", State: "running", PID: 812, CPUPct: webCPU, RSS: 4096},
+	}
+	snap.Health = &collect.HostHealth{
+		CheckedAt: t, VulnKnown: true, Vulnerable: 2, VulnDBAgeHours: 5,
+		KernelKnown: true, RebootRequired: true,
+		BECount: 2, BEActive: "default", BENext: "upgrade",
+	}
+	return snap
+}
+
+func TestSeriesVM(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	now := time.Now()
+	s.Ingest(bsdHostSnap(now.Add(-time.Second), 40))
+	s.Ingest(bsdHostSnap(now, 60))
+
+	labels, data := seriesOf(t, s, "/api/series?metric=vm&range=1h")
+	// Orphaned instances have no CPU, so only the running guest is a column.
+	if len(labels) != 2 || labels[1] != "web" {
+		t.Fatalf("labels: %v", labels)
+	}
+	if data[1][0] != 40 || data[1][1] != 60 {
+		t.Fatalf("web cpu: %v", data[1])
+	}
+	if labels, _ := seriesOf(t, s, "/api/series?metric=vm&range=1h&name=nope"); len(labels) != 1 {
+		t.Fatalf("name filter: %v", labels)
+	}
+}
+
+func TestPrometheusHostHealthAndVMs(t *testing.T) {
+	s := testServer(config.AuthConfig{})
+	s.Ingest(bsdHostSnap(time.Now(), 60))
+
+	body := get(s, "/metrics", nil).Body.String()
+	for _, want := range []string{
+		`beastie_vm_up{vm="old"} 0`,
+		`beastie_vm_up{vm="web"} 1`,
+		`beastie_vm_cpu_percent{vm="web"} 60`,
+		`beastie_vm_rss_bytes{vm="web"} 4096`,
+		`beastie_pkg_vulnerable 2`,
+		`beastie_pkg_vulndb_age_hours 5`,
+		`beastie_reboot_required 1`,
+		`beastie_be_pending 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("exposition missing %q", want)
+		}
+	}
+
+	// A check that hasn't succeeded must not export a reassuring 0.
+	snap := sampleSnap(time.Now())
+	snap.Health = &collect.HostHealth{CheckedAt: time.Now()}
+	s.Ingest(snap)
+	body = get(s, "/metrics", nil).Body.String()
+	for _, absent := range []string{"beastie_pkg_vulnerable ", "beastie_reboot_required ", "beastie_be_pending "} {
+		if strings.Contains(body, absent) {
+			t.Errorf("unknown part exported: %q", absent)
+		}
+	}
+}
